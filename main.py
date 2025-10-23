@@ -1,13 +1,22 @@
 import sys
+from collections import deque
+
 import numpy as np
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                             QTabWidget, QToolBar, QComboBox, QPushButton, QLabel)
-from PyQt6.QtCore import QTimer, QThread, pyqtSignal
 import pyqtgraph as pg
 import serial
 import serial.tools.list_ports
+from PyQt6.QtCore import QTimer, QThread, pyqtSignal
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QTabWidget, QToolBar, QComboBox, QPushButton, QLabel)
 from serial.serialutil import SerialException
+
 from eeg_channel_widget import EEGChannelWidget
+from fourier_analysis_widget import FourierAnalysisWidget
+
+PACKET_START = b'\xAA\x55'
+PACKET_SIZE = 8
+
+MAX_BUFFER_SIZE = 4096
 
 
 class SerialWorker(QThread):
@@ -17,16 +26,34 @@ class SerialWorker(QThread):
         super().__init__()
         self.sport = sport
         self.running = False
+        self.rxBuf = deque(maxlen=MAX_BUFFER_SIZE)
 
     def run(self):
         self.running = True
+        if not self.sport.is_open:
+            return
+
         while self.running:
             try:
-                if self.sport.is_open and self.sport.in_waiting >= 32:
-                    raw_data = self.sport.read(32)
-                    data = np.zeros(16, dtype=np.uint16)
-                    for i in range(16):
-                        data[i] = raw_data[2 * i] | (raw_data[2 * i + 1] << 8)
+                if self.sport.in_waiting > 0:
+                    raw_data = self.sport.read(self.sport.in_waiting)
+                    self.rxBuf.extend(raw_data)
+                    # выделяем ацп пакет
+                    buffer_bytes = bytes(self.rxBuf)
+                    start_index = buffer_bytes.find(PACKET_START)
+                    if start_index == -1:
+                        continue
+                    if len(buffer_bytes) - start_index < PACKET_SIZE:
+                        continue
+                    if not (buffer_bytes[start_index + PACKET_SIZE - 2] == 0x55 and buffer_bytes[
+                        start_index + PACKET_SIZE - 1] == 0xAA):
+                        continue
+                    packet = buffer_bytes[start_index:start_index + PACKET_SIZE]
+                    for _ in range(start_index + PACKET_SIZE):
+                        self.rxBuf.popleft()
+                    data = np.zeros(PACKET_SIZE // 2 - 2, dtype=np.uint16)
+                    for i in range(0, PACKET_SIZE // 2 - 2):
+                        data[i] = packet[2 * i + 2] | (packet[2 * i + 1 + 2] << 8)
                     self.data_received.emit(data)
             except Exception as e:
                 print(f"Ошибка чтения: {e}")
@@ -47,7 +74,7 @@ class EEGPlotter(QMainWindow):
         self.sport = serial.Serial(None, self.BAUD_RATE)
 
         self.X_AXIS_RANGE = 15  # в сек.
-        self.SAMPLE_RATE = 100  # Гц
+        self.SAMPLE_RATE = 143  # Гц
 
         self.serial_worker = None
 
@@ -62,9 +89,14 @@ class EEGPlotter(QMainWindow):
         self.graph_layout.addWidget(self.channel1)
         self.graph_layout.addWidget(self.channel2)
 
+        self.fourier_widget = FourierAnalysisWidget(
+            channels=[self.channel1, self.channel2],
+            sample_rate=self.SAMPLE_RATE
+        )
+        self.tab_widget.addTab(self.fourier_widget, "Фурье-анализ")
         self.plot_timer = QTimer()
         self.plot_timer.timeout.connect(self._update_all_channels)
-        self.plot_timer.start(100)  # 100 мс = 10 FPS
+        self.plot_timer.start(25)
 
     def _get_available_ports(self):
         """Получение списка доступных COM-портов"""
@@ -125,6 +157,7 @@ class EEGPlotter(QMainWindow):
         index = self.port_combo.findText(current_port)
         if index >= 0:
             self.port_combo.setCurrentIndex(index)
+
     def _init_test_data(self):
         """Инициализация тестовыми синусоидами"""
         x = np.linspace(0, self.X_AXIS_RANGE, self.X_AXIS_RANGE * self.SAMPLE_RATE)
@@ -166,12 +199,8 @@ class EEGPlotter(QMainWindow):
     def update_data(self, data):
         """Обновление данных по событию от воркера"""
         if data is not None:
-            # Распределяем данные по каналам (пример)
-            for i, value in enumerate(data):
-                if i % 2 == 0:
-                    self.channel1.append_data(value)
-                else:
-                    self.channel2.append_data(value)
+            self.channel1.append_data(data[0])
+            self.channel2.append_data(data[1])
 
     def _update_all_channels(self):
         """Обновление всех графиков по таймеру"""
