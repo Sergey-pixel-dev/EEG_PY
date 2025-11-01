@@ -10,11 +10,11 @@ from scipy import fft
 class FourierAnalysisWidget(QWidget):
     """Виджет для Фурье-анализа ЭЭГ сигналов"""
 
-    def __init__(self, channels, sample_rate=100):
+    def __init__(self, channels, sample_freq=100):
         super().__init__()
 
         self.channels = channels
-        self.sample_rate = sample_rate
+        self.sample_rate = sample_freq
         self.selected_channel_index = 0
 
         self._setup_ui()
@@ -78,7 +78,7 @@ class FourierAnalysisWidget(QWidget):
         """Обновление Фурье-анализа"""
         try:
             channel = self.channels[self.selected_channel_index]
-            signal_data = channel.data_to_display.get_buffer()
+            signal_data = channel.data.get_straight_buffer()
             signal = np.asarray(signal_data, dtype=np.float32)
 
             if len(signal) < 10:
