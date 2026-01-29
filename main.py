@@ -8,11 +8,16 @@ import serial
 import serial.tools.list_ports
 from PyQt6.QtCore import QTimer, QThread, pyqtSignal
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                             QTabWidget, QToolBar, QComboBox, QPushButton, QLabel)
+                             QTabWidget, QToolBar, QComboBox, QPushButton, QLabel,
+                             QGroupBox, QCheckBox, QDoubleSpinBox, QSpinBox, QFormLayout,
+                             QFileDialog, QSlider, QDialog, QTextEdit, QDialogButtonBox)
+from PyQt6.QtCore import Qt
 from serial.serialutil import SerialException
 
 from eeg_channel_widget import EEGChannelWidget
 from fourier_analysis_widget import FourierAnalysisWidget
+from data_recorder import DataRecorder
+from playback_worker import PlaybackWorker
 
 PACKET_START = b'\xAA\x55'
 PACKET_SIZE = 8
@@ -58,16 +63,17 @@ class SerialWorker(QThread):
                     self.rxBuf[self.buf_pos:self.buf_pos + bytes_to_add] = raw_data
                     self.buf_pos += bytes_to_add
 
+                    search_pos = 0
                     while True:
-                        start_idx = self.rxBuf.find(PACKET_START, 0, self.buf_pos)
+                        start_idx = self.rxBuf.find(PACKET_START, search_pos, self.buf_pos)
                         if start_idx == -1:
+                            search_pos = self.buf_pos
                             break
                         if self.buf_pos - start_idx < PACKET_SIZE:
                             break
                         end_idx = start_idx + PACKET_SIZE - 1
                         if not (self.rxBuf[end_idx - 1] == 0x55 and self.rxBuf[end_idx] == 0xAA):
-                            self.rxBuf[start_idx:self.buf_pos - 1] = self.rxBuf[start_idx + 1:self.buf_pos]
-                            self.buf_pos -= 1
+                            search_pos = start_idx + 1
                             continue
                         parse_start = time.perf_counter()
                         packet = bytes(self.rxBuf[start_idx:start_idx + PACKET_SIZE])
@@ -82,7 +88,6 @@ class SerialWorker(QThread):
                         self.packet_count += 1
                         current_time = time.perf_counter()
 
-                        # Вывод статистики каждую 1 секунду
                         if current_time - self.last_print_time >= 1.0:
                             elapsed = current_time - self.last_time
                             packet_rate = self.packet_count / elapsed
@@ -97,9 +102,16 @@ class SerialWorker(QThread):
                                   f"Среднее: {avg_parse_time:.3f}мс")
 
                             self.last_print_time = current_time
-                        self.rxBuf[0:self.buf_pos - PACKET_SIZE] = self.rxBuf[PACKET_SIZE:self.buf_pos]
-                        self.buf_pos -= PACKET_SIZE
+                        search_pos = start_idx + PACKET_SIZE
                         self.data_received.emit(data)
+
+                    # Сдвигаем буфер только один раз после обработки всех пакетов
+                    if search_pos > 0 and search_pos < self.buf_pos:
+                        remaining = self.buf_pos - search_pos
+                        self.rxBuf[0:remaining] = self.rxBuf[search_pos:self.buf_pos]
+                        self.buf_pos = remaining
+                    elif search_pos >= self.buf_pos:
+                        self.buf_pos = 0
                 else:
                     # Нет данных - немного спим чтобы не грузить CPU
                     time.sleep(0.0001)  # 0.1 мс
@@ -124,10 +136,19 @@ class EEGPlotter(QMainWindow):
         self.BAUD_RATE = 1500000
         self.sport = serial.Serial(None, self.BAUD_RATE)
 
-        self.X_AXIS_RANGE = 5  # в сек.
-        self.SAMPLE_FREQ = 1000  # Гц
+        self.X_AXIS_RANGE = 8  # в сек.
+        self.SAMPLE_FREQ = 2000  # Гц
 
         self.serial_worker = None
+
+        # Запись
+        self.data_recorder = DataRecorder(self.SAMPLE_FREQ)
+        self.is_recording = False
+
+        # Воспроизведение
+        self.playback_worker = None
+        self.playback_mode = False
+        self._slider_dragging = False
 
         self._setup_ui()
 
@@ -147,13 +168,17 @@ class EEGPlotter(QMainWindow):
         self.tab_widget.addTab(self.fourier_widget, "Фурье-анализ")
         self.plot_timer = QTimer()
         self.plot_timer.timeout.connect(self._update_all_channels)
-        self.plot_timer.start(10)
+        self.plot_timer.start(33)
 
     def _get_available_ports(self):
-        """Получение списка доступных COM-портов"""
+        """Получение списка доступных USB COM-портов"""
         ports = serial.tools.list_ports.comports()
-        available_ports = [port.device for port in ports]
-        return available_ports if available_ports else ["Нет доступных портов"]
+        usb_ports = [
+            f"{port.device} - {port.description}"
+            for port in ports
+            if port.vid is not None
+        ]
+        return usb_ports if usb_ports else ["Нет доступных портов"]
 
     def _setup_ui(self):
         """Настройка интерфейса"""
@@ -182,6 +207,50 @@ class EEGPlotter(QMainWindow):
         self.disconnect_btn.setEnabled(False)
         toolbar.addWidget(self.disconnect_btn)
 
+        toolbar.addSeparator()
+
+        # Кнопка записи
+        self.record_btn = QPushButton("Rec")
+        self.record_btn.setCheckable(True)
+        self.record_btn.clicked.connect(self._toggle_recording)
+        self.record_btn.setEnabled(False)
+        self.record_btn.setStyleSheet("QPushButton:checked { background-color: #ff4444; color: white; }")
+        toolbar.addWidget(self.record_btn)
+
+        toolbar.addSeparator()
+
+        # Кнопка открытия файла
+        self.open_btn = QPushButton("Открыть")
+        self.open_btn.clicked.connect(self._open_recording)
+        toolbar.addWidget(self.open_btn)
+
+        # Кнопка воспроизведения/паузы
+        self.play_btn = QPushButton("Play")
+        self.play_btn.clicked.connect(self._toggle_playback)
+        self.play_btn.setEnabled(False)
+        toolbar.addWidget(self.play_btn)
+
+        # Кнопка остановки воспроизведения
+        self.stop_playback_btn = QPushButton("Stop")
+        self.stop_playback_btn.clicked.connect(self._stop_playback)
+        self.stop_playback_btn.setEnabled(False)
+        toolbar.addWidget(self.stop_playback_btn)
+
+        # Слайдер позиции воспроизведения
+        self.playback_slider = QSlider(Qt.Orientation.Horizontal)
+        self.playback_slider.setRange(0, 1000)
+        self.playback_slider.setValue(0)
+        self.playback_slider.setFixedWidth(150)
+        self.playback_slider.setEnabled(False)
+        self.playback_slider.sliderPressed.connect(self._on_slider_pressed)
+        self.playback_slider.sliderReleased.connect(self._on_slider_released)
+        self.playback_slider.valueChanged.connect(self._on_slider_value_changed)
+        toolbar.addWidget(self.playback_slider)
+
+        # Метка времени воспроизведения
+        self.time_label = QLabel("00:00 / 00:00")
+        toolbar.addWidget(self.time_label)
+
         self.tab_widget = QTabWidget()
         self.setCentralWidget(self.tab_widget)
 
@@ -192,7 +261,106 @@ class EEGPlotter(QMainWindow):
 
         self.tab_settings = QWidget()
         settings_layout = QVBoxLayout()
-        settings_layout.addWidget(QLabel("Настройки (в разработке)"))
+
+        # Пресеты фильтров
+        preset_group = QGroupBox("Пресеты фильтров")
+        preset_layout = QFormLayout()
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems(["— Выбрать пресет —", "ЭЭГ", "ЭКГ", "ЭМГ"])
+        self.preset_combo.currentIndexChanged.connect(self._apply_preset)
+        preset_layout.addRow("Пресет:", self.preset_combo)
+        preset_group.setLayout(preset_layout)
+        settings_layout.addWidget(preset_group)
+
+        # Группа Notch-фильтра
+        notch_group = QGroupBox("Notch-фильтр (режекторный)")
+        notch_layout = QFormLayout()
+
+        self.notch_enabled_cb = QCheckBox("Включен")
+        self.notch_enabled_cb.setChecked(True)
+        notch_layout.addRow(self.notch_enabled_cb)
+
+        self.notch_freq_spin = QDoubleSpinBox()
+        self.notch_freq_spin.setRange(30.0, 70.0)
+        self.notch_freq_spin.setValue(50.0)
+        self.notch_freq_spin.setSuffix(" Гц")
+        notch_layout.addRow("Частота:", self.notch_freq_spin)
+
+        self.notch_q_spin = QDoubleSpinBox()
+        self.notch_q_spin.setRange(5.0, 50.0)
+        self.notch_q_spin.setValue(20.0)
+        notch_layout.addRow("Добротность Q:", self.notch_q_spin)
+
+        notch_group.setLayout(notch_layout)
+        settings_layout.addWidget(notch_group)
+
+        # Группа ФНЧ
+        lowpass_group = QGroupBox("Низкочастотный фильтр (ФНЧ)")
+        lowpass_layout = QFormLayout()
+
+        self.lowpass_enabled_cb = QCheckBox("Включен")
+        self.lowpass_enabled_cb.setChecked(False)
+        lowpass_layout.addRow(self.lowpass_enabled_cb)
+
+        self.lowpass_freq_spin = QDoubleSpinBox()
+        self.lowpass_freq_spin.setRange(10.0, 500.0)
+        self.lowpass_freq_spin.setValue(40.0)
+        self.lowpass_freq_spin.setSuffix(" Гц")
+        lowpass_layout.addRow("Частота среза:", self.lowpass_freq_spin)
+
+        self.lowpass_order_spin = QSpinBox()
+        self.lowpass_order_spin.setRange(2, 8)
+        self.lowpass_order_spin.setValue(4)
+        lowpass_layout.addRow("Порядок:", self.lowpass_order_spin)
+
+        lowpass_group.setLayout(lowpass_layout)
+        settings_layout.addWidget(lowpass_group)
+
+        # Группа ФВЧ
+        highpass_group = QGroupBox("Высокочастотный фильтр (ФВЧ)")
+        highpass_layout = QFormLayout()
+
+        self.highpass_enabled_cb = QCheckBox("Включен")
+        self.highpass_enabled_cb.setChecked(False)
+        highpass_layout.addRow(self.highpass_enabled_cb)
+
+        self.highpass_freq_spin = QDoubleSpinBox()
+        self.highpass_freq_spin.setRange(0.1, 10.0)
+        self.highpass_freq_spin.setValue(0.5)
+        self.highpass_freq_spin.setSuffix(" Гц")
+        self.highpass_freq_spin.setDecimals(1)
+        highpass_layout.addRow("Частота среза:", self.highpass_freq_spin)
+
+        highpass_group.setLayout(highpass_layout)
+        settings_layout.addWidget(highpass_group)
+
+        # Группа антиалиасингового фильтра
+        aa_group = QGroupBox("Антиалиасинговый фильтр (для дисплея)")
+        aa_layout = QFormLayout()
+
+        self.aa_enabled_cb = QCheckBox("Включен")
+        self.aa_enabled_cb.setChecked(True)
+        aa_layout.addRow(self.aa_enabled_cb)
+
+        self.aa_freq_spin = QDoubleSpinBox()
+        self.aa_freq_spin.setRange(20.0, 61.5)
+        self.aa_freq_spin.setValue(55.0)
+        self.aa_freq_spin.setSuffix(" Гц")
+        aa_layout.addRow("Частота среза:", self.aa_freq_spin)
+
+        self.aa_order_spin = QSpinBox()
+        self.aa_order_spin.setRange(2, 8)
+        self.aa_order_spin.setValue(4)
+        aa_layout.addRow("Порядок:", self.aa_order_spin)
+
+        aa_group.setLayout(aa_layout)
+        settings_layout.addWidget(aa_group)
+
+        # Кнопка применения настроек
+        apply_btn = QPushButton("Применить настройки")
+        apply_btn.clicked.connect(self._apply_filter_settings)
+        settings_layout.addWidget(apply_btn)
+
         settings_layout.addStretch()
         self.tab_settings.setLayout(settings_layout)
         self.tab_widget.addTab(self.tab_settings, "Настройки")
@@ -217,9 +385,294 @@ class EEGPlotter(QMainWindow):
         for val in x:
             self.channel2.append_data(np.sin(val * 2) * 800 + 1700)
 
+    def _apply_filter_settings(self):
+        """Применение настроек фильтров к обоим каналам"""
+        # Notch-фильтр
+        notch_enabled = self.notch_enabled_cb.isChecked()
+        notch_freq = self.notch_freq_spin.value()
+        notch_q = self.notch_q_spin.value()
+
+        # ФНЧ
+        lowpass_enabled = self.lowpass_enabled_cb.isChecked()
+        lowpass_freq = self.lowpass_freq_spin.value()
+        lowpass_order = self.lowpass_order_spin.value()
+
+        # ФВЧ
+        highpass_enabled = self.highpass_enabled_cb.isChecked()
+        highpass_freq = self.highpass_freq_spin.value()
+
+        # Антиалиасинговый фильтр
+        aa_enabled = self.aa_enabled_cb.isChecked()
+        aa_freq = self.aa_freq_spin.value()
+        aa_order = self.aa_order_spin.value()
+
+        # Применить к обоим каналам
+        for channel in [self.channel1, self.channel2]:
+            channel.set_notch_filter(notch_enabled, notch_freq, notch_q)
+            channel.set_lowpass_filter(lowpass_enabled, lowpass_freq, lowpass_order)
+            channel.set_highpass_filter(highpass_enabled, highpass_freq)
+            channel.set_antialiasing_filter(aa_enabled, aa_freq, aa_order)
+
+        print(f"Настройки фильтров применены: "
+              f"Notch={notch_enabled}({notch_freq}Гц, Q={notch_q}), "
+              f"ФНЧ={lowpass_enabled}({lowpass_freq}Гц, порядок={lowpass_order}), "
+              f"ФВЧ={highpass_enabled}({highpass_freq}Гц), "
+              f"AA={aa_enabled}({aa_freq}Гц, порядок={aa_order})")
+
+    def _apply_preset(self, index):
+        """Применить пресет фильтров"""
+        presets = {
+            1: {'hp': 0.5, 'lp': 45, 'notch': 50, 'lp_order': 4},   # ЭЭГ
+            2: {'hp': 0.5, 'lp': 150, 'notch': 50, 'lp_order': 4},  # ЭКГ
+            3: {'hp': 10.0, 'lp': 500, 'notch': 50, 'lp_order': 4}, # ЭМГ
+        }
+        if index not in presets:
+            return
+        p = presets[index]
+        self.notch_enabled_cb.setChecked(True)
+        self.notch_freq_spin.setValue(p['notch'])
+        self.lowpass_enabled_cb.setChecked(True)
+        self.lowpass_freq_spin.setValue(p['lp'])
+        self.lowpass_order_spin.setValue(p['lp_order'])
+        self.highpass_enabled_cb.setChecked(True)
+        self.highpass_freq_spin.setValue(p['hp'])
+        self._apply_filter_settings()
+
+    # ==================== Запись ====================
+
+    def _toggle_recording(self, checked: bool):
+        """Включить/выключить запись"""
+        if checked:
+            self.data_recorder.start_recording()
+            self.is_recording = True
+            self.record_btn.setText("Stop")
+            print("Запись начата")
+        else:
+            self.is_recording = False
+            self.record_btn.setText("Rec")
+            self._save_recording()
+
+    def _save_recording(self):
+        """Сохранить запись в файл"""
+        if self.data_recorder.get_samples_count() == 0:
+            print("Нет данных для сохранения")
+            return
+
+        suggested_name = self.data_recorder.stop_recording()
+        duration = self.data_recorder.get_duration()
+
+        # Диалог описания записи
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Описание записи")
+        dialog.setMinimumWidth(400)
+        dlg_layout = QVBoxLayout()
+
+        start_time_str = self.data_recorder.start_time.strftime('%H:%M:%S') if self.data_recorder.start_time else "—"
+        dlg_layout.addWidget(QLabel(f"Время записи: {start_time_str}, длительность: {duration:.1f} сек"))
+
+        dlg_layout.addWidget(QLabel("Описание:"))
+        notes_edit = QTextEdit()
+        notes_edit.setPlaceholderText("Введите описание записи...")
+        notes_edit.setMaximumHeight(120)
+        dlg_layout.addWidget(notes_edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        dlg_layout.addWidget(buttons)
+
+        dialog.setLayout(dlg_layout)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            print("Сохранение отменено")
+            return
+
+        notes = notes_edit.toPlainText()
+
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить запись", suggested_name,
+            "EEG Recording (*.eeg)"
+        )
+
+        if filepath:
+            filter_settings = self._get_filter_settings()
+            self.data_recorder.save(filepath, filter_settings, notes=notes)
+            print(f"Запись сохранена: {filepath} ({duration:.1f} сек)")
+        else:
+            print("Сохранение отменено")
+
+    def _get_filter_settings(self) -> dict:
+        """Получить текущие настройки фильтров"""
+        return {
+            'notch': {
+                'enabled': self.notch_enabled_cb.isChecked(),
+                'freq': self.notch_freq_spin.value(),
+                'q': self.notch_q_spin.value()
+            },
+            'lowpass': {
+                'enabled': self.lowpass_enabled_cb.isChecked(),
+                'freq': self.lowpass_freq_spin.value(),
+                'order': self.lowpass_order_spin.value()
+            },
+            'highpass': {
+                'enabled': self.highpass_enabled_cb.isChecked(),
+                'freq': self.highpass_freq_spin.value()
+            },
+            'antialiasing': {
+                'enabled': self.aa_enabled_cb.isChecked(),
+                'freq': self.aa_freq_spin.value(),
+                'order': self.aa_order_spin.value()
+            }
+        }
+
+    # ==================== Воспроизведение ====================
+
+    def _open_recording(self):
+        """Открыть файл записи для воспроизведения"""
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Открыть запись", "",
+            "EEG Recording (*.eeg)"
+        )
+
+        if filepath:
+            try:
+                self.playback_worker = PlaybackWorker()
+                self.playback_worker.load(filepath)
+                self.playback_worker.data_received.connect(self.update_data)
+                self.playback_worker.playback_finished.connect(self._on_playback_finished)
+                self.playback_worker.playback_progress.connect(self._on_playback_progress)
+
+                # Обновляем UI
+                self.play_btn.setEnabled(True)
+                self.stop_playback_btn.setEnabled(True)
+                self.playback_slider.setEnabled(True)
+                self.playback_slider.setValue(0)
+
+                # Показываем длительность
+                duration = self.playback_worker.get_duration()
+                self.time_label.setText(f"00:00 / {self._format_time(duration)}")
+
+                metadata = self.playback_worker.get_metadata()
+                print(f"Загружен файл: {filepath}")
+                print(f"  Длительность: {duration:.1f} сек, Частота: {metadata.get('sample_freq', 2000)} Гц")
+
+            except Exception as e:
+                print(f"Ошибка загрузки файла: {e}")
+
+    def _toggle_playback(self):
+        """Запуск/пауза воспроизведения"""
+        if self.playback_worker is None:
+            return
+
+        if not self.playback_worker.isRunning():
+            # Запускаем воспроизведение
+            self.playback_mode = True
+            self._clear_channel_data()
+            self.playback_worker.reset()
+            self.playback_worker.start()
+            self.play_btn.setText("Pause")
+            # Отключаем serial controls
+            self.connect_btn.setEnabled(False)
+            self.port_combo.setEnabled(False)
+            self.open_btn.setEnabled(False)
+            print("Воспроизведение начато")
+        elif self.playback_worker.paused:
+            # Возобновляем
+            self.playback_worker.resume()
+            self.play_btn.setText("Pause")
+            print("Воспроизведение возобновлено")
+        else:
+            # Ставим на паузу
+            self.playback_worker.pause()
+            self.play_btn.setText("Resume")
+            print("Воспроизведение приостановлено")
+
+    def _stop_playback(self):
+        """Остановить воспроизведение"""
+        if self.playback_worker:
+            self.playback_worker.stop()
+            self.playback_worker.wait()
+
+        self.playback_mode = False
+        self.play_btn.setText("Play")
+        self.playback_slider.setValue(0)
+
+        # Включаем serial controls
+        self.connect_btn.setEnabled(True)
+        self.port_combo.setEnabled(True)
+        self.open_btn.setEnabled(True)
+
+        print("Воспроизведение остановлено")
+
+    def _on_playback_finished(self):
+        """Обработка окончания воспроизведения"""
+        self.playback_mode = False
+        self.play_btn.setText("Play")
+
+        # Включаем serial controls
+        self.connect_btn.setEnabled(True)
+        self.port_combo.setEnabled(True)
+        self.open_btn.setEnabled(True)
+
+        print("Воспроизведение завершено")
+
+    def _on_playback_progress(self, current_sec: float, total_sec: float):
+        """Обновление прогресса воспроизведения"""
+        if not self._slider_dragging:
+            progress = int((current_sec / total_sec) * 1000) if total_sec > 0 else 0
+            self.playback_slider.setValue(progress)
+        self.time_label.setText(f"{self._format_time(current_sec)} / {self._format_time(total_sec)}")
+
+    def _on_slider_pressed(self):
+        """Пользователь начал перетаскивать слайдер"""
+        self._slider_dragging = True
+
+    def _on_slider_released(self):
+        """Пользователь отпустил слайдер"""
+        self._slider_dragging = False
+        if self.playback_worker and self.playback_worker.is_loaded():
+            position = self.playback_slider.value() / 1000.0
+            self.playback_worker.seek(position)
+            self._clear_channel_data()
+
+    def _on_slider_value_changed(self, value: int):
+        """Изменение значения слайдера"""
+        if self._slider_dragging and self.playback_worker:
+            duration = self.playback_worker.get_duration()
+            current = (value / 1000.0) * duration
+            self.time_label.setText(f"{self._format_time(current)} / {self._format_time(duration)}")
+
+    def _clear_channel_data(self):
+        """Очистить буферы каналов"""
+        self.channel1.clear_data()
+        self.channel2.clear_data()
+
+    def _disable_playback_controls(self):
+        """Отключить элементы управления воспроизведением"""
+        self.open_btn.setEnabled(False)
+        self.play_btn.setEnabled(False)
+        self.stop_playback_btn.setEnabled(False)
+        self.playback_slider.setEnabled(False)
+
+    def _enable_playback_controls(self):
+        """Включить элементы управления воспроизведением"""
+        self.open_btn.setEnabled(True)
+        if self.playback_worker and self.playback_worker.is_loaded():
+            self.play_btn.setEnabled(True)
+            self.stop_playback_btn.setEnabled(True)
+            self.playback_slider.setEnabled(True)
+
+    @staticmethod
+    def _format_time(seconds: float) -> str:
+        """Форматировать время как MM:SS"""
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes:02d}:{secs:02d}"
+
     def connect_sport(self):
         """Подключение к serial порту"""
-        port = self.port_combo.currentText()
+        port_text = self.port_combo.currentText()
+        port = port_text.split(" - ")[0]
         try:
             self.sport = serial.Serial(port, self.BAUD_RATE)
             self.serial_worker = SerialWorker(self.sport)
@@ -228,12 +681,20 @@ class EEGPlotter(QMainWindow):
             self.connect_btn.setEnabled(False)
             self.disconnect_btn.setEnabled(True)
             self.port_combo.setEnabled(False)
+            # Включаем запись, отключаем воспроизведение
+            self.record_btn.setEnabled(True)
+            self._disable_playback_controls()
             print(f"Подключено к {port}")
         except SerialException as e:
             print(f"Ошибка подключения: {e}")
 
     def disconnect_sport(self):
         """Отключение от serial порта"""
+        # Остановить запись если активна
+        if self.is_recording:
+            self._toggle_recording(False)
+            self.record_btn.setChecked(False)
+
         if self.serial_worker:
             self.serial_worker.stop()
             self.serial_worker = None
@@ -244,14 +705,20 @@ class EEGPlotter(QMainWindow):
         self.connect_btn.setEnabled(True)
         self.disconnect_btn.setEnabled(False)
         self.port_combo.setEnabled(True)
+        # Отключаем запись, включаем воспроизведение
+        self.record_btn.setEnabled(False)
+        self._enable_playback_controls()
 
         print("Отключено")
 
     def update_data(self, data):
         """Обновление данных по событию от воркера"""
         if data is not None:
-            self.channel1.append_data(data[0])
-            self.channel2.append_data(data[1])
+            self.channel1.append_data(data[1])
+            self.channel2.append_data(data[0])
+            # Записываем если активна запись (и не в режиме воспроизведения)
+            if self.is_recording and not self.playback_mode:
+                self.data_recorder.add_sample(data)
 
     def _update_all_channels(self):
         """Обновление всех графиков по таймеру"""
@@ -262,6 +729,9 @@ class EEGPlotter(QMainWindow):
         """Обработка закрытия окна"""
         if self.serial_worker:
             self.serial_worker.stop()
+        if self.playback_worker:
+            self.playback_worker.stop()
+            self.playback_worker.wait()
         if self.sport.is_open:
             self.sport.close()
         event.accept()
