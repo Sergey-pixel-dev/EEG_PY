@@ -260,6 +260,72 @@ class EEGChannelWidget(QWidget):
             )
             self.zi_highpass = signal.sosfilt_zi(self.sos_highpass)
 
+    def set_sample_freq(self, new_freq):
+        """Изменить частоту дискретизации — пересоздаёт фильтры, буферы, ось X"""
+        self.sample_freq = new_freq
+
+        # Пересчитать прореживание: ~125 точек/сек на дисплей
+        self.n_i = max(1, int(new_freq / 125))
+
+        # Пересоздать буферы
+        self.data_to_display = CircularBuffer(
+            size=np.int32(self.x_range * self.sample_freq / self.n_i),
+            dtype=np.float32
+        )
+        self.data = CircularBuffer(
+            size=np.int32(self.x_range * self.sample_freq),
+            dtype=np.float32
+        )
+        self.raw_data = CircularBuffer(
+            size=np.int32(self.x_range * self.sample_freq),
+            dtype=np.float32
+        )
+
+        # Пересоздать ось X
+        self.x_axis = np.linspace(
+            0,
+            self.x_range,
+            np.int32(self.x_range * self.sample_freq / self.n_i),
+            dtype=np.float32
+        )
+
+        # Пересоздать все фильтры
+        b_notch, a_notch = signal.iirnotch(
+            self.notch_freq, self.quality_factor, self.sample_freq
+        )
+        self.sos_notch = signal.tf2sos(b_notch, a_notch)
+        self.zi_notch = signal.sosfilt_zi(self.sos_notch)
+
+        max_cutoff = self.sample_freq / 2 - 1
+        lp_freq = min(self.cutoff_freq, max_cutoff)
+        self.sos_lowpass = signal.butter(
+            N=self.filter_order, Wn=lp_freq, btype='low',
+            fs=self.sample_freq, output='sos'
+        )
+        self.zi_lowpass = signal.sosfilt_zi(self.sos_lowpass)
+
+        self.sos_highpass = signal.butter(
+            N=2, Wn=self.highpass_freq, btype='high',
+            fs=self.sample_freq, output='sos'
+        )
+        self.zi_highpass = signal.sosfilt_zi(self.sos_highpass)
+
+        aa_freq = min(self.aa_cutoff_freq, max_cutoff)
+        self.sos_aa = signal.butter(
+            N=self.aa_filter_order, Wn=aa_freq, btype='low',
+            fs=self.sample_freq, output='sos'
+        )
+        self.zi_aa = signal.sosfilt_zi(self.sos_aa)
+
+        self.batch_buffer.clear()
+        self.i = 0
+        if self.curve is not None:
+            self.plot_widget.removeItem(self.curve)
+            self.curve = None
+        if self.cursor_line is not None:
+            self.plot_widget.removeItem(self.cursor_line)
+            self.cursor_line = None
+
     def set_antialiasing_filter(self, enabled, cutoff=55.0, order=4):
         """Настройка антиалиасингового фильтра (для дисплея)"""
         self.aa_enabled = enabled

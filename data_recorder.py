@@ -48,17 +48,12 @@ class DataRecorder:
         """Количество записанных сэмплов"""
         return len(self.data_buffer)
 
-    def save(self, filepath: str, filter_settings: Optional[dict] = None, notes: str = ''):
+    def save(self, filepath: str, notes: str = ''):
         """Сохранить запись в файл .eeg
 
         Args:
             filepath: Путь к файлу
-            filter_settings: Словарь с настройками фильтров:
-                {
-                    'notch': {'enabled': bool, 'freq': float, 'q': float},
-                    'lowpass': {'enabled': bool, 'freq': float, 'order': int},
-                    'highpass': {'enabled': bool, 'freq': float}
-                }
+            notes: Описание записи
         """
         if not self.data_buffer:
             raise ValueError("Нет данных для сохранения")
@@ -68,13 +63,12 @@ class DataRecorder:
 
         # Создаём метаданные
         metadata = {
-            'version': 1,
+            'version': 2,
             'sample_freq': self.sample_freq,
             'channels': self.channels,
             'created_at': self.start_time.isoformat() if self.start_time else datetime.now().isoformat(),
             'duration_seconds': self.get_duration(),
             'samples_count': len(self.data_buffer),
-            'filters': filter_settings or {},
             'device_info': 'EEG ADC',
             'notes': notes
         }

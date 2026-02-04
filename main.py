@@ -7,10 +7,11 @@ import pyqtgraph as pg
 import serial
 import serial.tools.list_ports
 from PyQt6.QtCore import QTimer, QThread, pyqtSignal
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QTabWidget, QToolBar, QComboBox, QPushButton, QLabel,
                              QGroupBox, QCheckBox, QDoubleSpinBox, QSpinBox, QFormLayout,
-                             QFileDialog, QSlider, QDialog, QTextEdit, QDialogButtonBox)
+                             QFileDialog, QSlider, QDialog, QTextEdit, QDialogButtonBox,
+                             QScrollArea)
 from PyQt6.QtCore import Qt
 from serial.serialutil import SerialException
 
@@ -156,10 +157,19 @@ class EEGPlotter(QMainWindow):
         self.channel1 = EEGChannelWidget("Канал 1", self.X_AXIS_RANGE, (0, 3400), self.SAMPLE_FREQ)
         self.channel2 = EEGChannelWidget("Канал 2", self.X_AXIS_RANGE, (0, 3400), self.SAMPLE_FREQ)
 
+        self.channels = [self.channel1, self.channel2]
+
         self._init_test_data()
 
-        self.graph_layout.addWidget(self.channel1)
-        self.graph_layout.addWidget(self.channel2)
+        for i, ch in enumerate(self.channels):
+            ch.setMinimumHeight(250)
+            ch.setMaximumHeight(500)
+            self.graph_layout.addWidget(ch)
+
+            cb = QCheckBox(f"Канал {i + 1}")
+            cb.setChecked(True)
+            cb.toggled.connect(lambda checked, c=ch: c.setVisible(checked))
+            self.channel_checks_layout.insertWidget(self.channel_checks_layout.count() - 1, cb)
 
         self.fourier_widget = FourierAnalysisWidget(
             channels=[self.channel1, self.channel2],
@@ -225,13 +235,13 @@ class EEGPlotter(QMainWindow):
         toolbar.addWidget(self.open_btn)
 
         # Кнопка воспроизведения/паузы
-        self.play_btn = QPushButton("Play")
+        self.play_btn = QPushButton("Воспр.")
         self.play_btn.clicked.connect(self._toggle_playback)
         self.play_btn.setEnabled(False)
         toolbar.addWidget(self.play_btn)
 
         # Кнопка остановки воспроизведения
-        self.stop_playback_btn = QPushButton("Stop")
+        self.stop_playback_btn = QPushButton("Стоп")
         self.stop_playback_btn.clicked.connect(self._stop_playback)
         self.stop_playback_btn.setEnabled(False)
         toolbar.addWidget(self.stop_playback_btn)
@@ -251,12 +261,35 @@ class EEGPlotter(QMainWindow):
         self.time_label = QLabel("00:00 / 00:00")
         toolbar.addWidget(self.time_label)
 
+        # Кнопка информации о файле (скрыта до загрузки)
+        self.file_info_btn = QPushButton("")
+        self.file_info_btn.setFlat(True)
+        self.file_info_btn.clicked.connect(self._show_file_info)
+        self.file_info_action = toolbar.addWidget(self.file_info_btn)
+        self.file_info_action.setVisible(False)
+
         self.tab_widget = QTabWidget()
         self.setCentralWidget(self.tab_widget)
 
         self.tab_graph = QWidget()
+        tab_graph_layout = QVBoxLayout()
+
+        # Панель чекбоксов каналов
+        self.channel_checks_layout = QHBoxLayout()
+        self.channel_checks_layout.addWidget(QLabel("Каналы:"))
+        self.channel_checks_layout.addStretch()
+        tab_graph_layout.addLayout(self.channel_checks_layout)
+
+        # Прокручиваемая область для графиков
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_content = QWidget()
         self.graph_layout = QVBoxLayout()
-        self.tab_graph.setLayout(self.graph_layout)
+        scroll_content.setLayout(self.graph_layout)
+        scroll_area.setWidget(scroll_content)
+        tab_graph_layout.addWidget(scroll_area)
+
+        self.tab_graph.setLayout(tab_graph_layout)
         self.tab_widget.addTab(self.tab_graph, "Графики")
 
         self.tab_settings = QWidget()
@@ -406,8 +439,8 @@ class EEGPlotter(QMainWindow):
         aa_freq = self.aa_freq_spin.value()
         aa_order = self.aa_order_spin.value()
 
-        # Применить к обоим каналам
-        for channel in [self.channel1, self.channel2]:
+        # Применить ко всем каналам
+        for channel in self.channels:
             channel.set_notch_filter(notch_enabled, notch_freq, notch_q)
             channel.set_lowpass_filter(lowpass_enabled, lowpass_freq, lowpass_order)
             channel.set_highpass_filter(highpass_enabled, highpass_freq)
@@ -495,8 +528,7 @@ class EEGPlotter(QMainWindow):
         )
 
         if filepath:
-            filter_settings = self._get_filter_settings()
-            self.data_recorder.save(filepath, filter_settings, notes=notes)
+            self.data_recorder.save(filepath, notes=notes)
             print(f"Запись сохранена: {filepath} ({duration:.1f} сек)")
         else:
             print("Сохранение отменено")
@@ -553,8 +585,23 @@ class EEGPlotter(QMainWindow):
                 self.time_label.setText(f"00:00 / {self._format_time(duration)}")
 
                 metadata = self.playback_worker.get_metadata()
+                file_freq = metadata.get('sample_freq', self.SAMPLE_FREQ)
+
+                # Установить частоту из файла
+                for ch in self.channels:
+                    ch.set_sample_freq(file_freq)
+                self._clear_channel_data()
+                self.fourier_widget.sample_rate = file_freq
+
+                # Показать имя файла
+                import os
+                fname = os.path.basename(filepath)
+                self.file_info_btn.setText(f"[{fname}]")
+                self.file_info_action.setVisible(True)
+                self._loaded_filepath = filepath
+
                 print(f"Загружен файл: {filepath}")
-                print(f"  Длительность: {duration:.1f} сек, Частота: {metadata.get('sample_freq', 2000)} Гц")
+                print(f"  Длительность: {duration:.1f} сек, Частота: {file_freq} Гц")
 
             except Exception as e:
                 print(f"Ошибка загрузки файла: {e}")
@@ -570,7 +617,7 @@ class EEGPlotter(QMainWindow):
             self._clear_channel_data()
             self.playback_worker.reset()
             self.playback_worker.start()
-            self.play_btn.setText("Pause")
+            self.play_btn.setText("Пауза")
             # Отключаем serial controls
             self.connect_btn.setEnabled(False)
             self.port_combo.setEnabled(False)
@@ -579,12 +626,12 @@ class EEGPlotter(QMainWindow):
         elif self.playback_worker.paused:
             # Возобновляем
             self.playback_worker.resume()
-            self.play_btn.setText("Pause")
+            self.play_btn.setText("Пауза")
             print("Воспроизведение возобновлено")
         else:
             # Ставим на паузу
             self.playback_worker.pause()
-            self.play_btn.setText("Resume")
+            self.play_btn.setText("Продолжить")
             print("Воспроизведение приостановлено")
 
     def _stop_playback(self):
@@ -594,8 +641,14 @@ class EEGPlotter(QMainWindow):
             self.playback_worker.wait()
 
         self.playback_mode = False
-        self.play_btn.setText("Play")
+        self.play_btn.setText("Воспр.")
         self.playback_slider.setValue(0)
+
+        # Восстанавливаем исходную частоту
+        for ch in self.channels:
+            ch.set_sample_freq(self.SAMPLE_FREQ)
+        self._clear_channel_data()
+        self.fourier_widget.sample_rate = self.SAMPLE_FREQ
 
         # Включаем serial controls
         self.connect_btn.setEnabled(True)
@@ -607,7 +660,13 @@ class EEGPlotter(QMainWindow):
     def _on_playback_finished(self):
         """Обработка окончания воспроизведения"""
         self.playback_mode = False
-        self.play_btn.setText("Play")
+        self.play_btn.setText("Воспр.")
+
+        # Восстанавливаем исходную частоту
+        for ch in self.channels:
+            ch.set_sample_freq(self.SAMPLE_FREQ)
+        self._clear_channel_data()
+        self.fourier_widget.sample_rate = self.SAMPLE_FREQ
 
         # Включаем serial controls
         self.connect_btn.setEnabled(True)
@@ -615,6 +674,42 @@ class EEGPlotter(QMainWindow):
         self.open_btn.setEnabled(True)
 
         print("Воспроизведение завершено")
+
+    def _show_file_info(self):
+        """Показать информацию о загруженном файле"""
+        if not self.playback_worker or not self.playback_worker.metadata:
+            return
+
+        meta = self.playback_worker.metadata
+        import os
+        fname = os.path.basename(getattr(self, '_loaded_filepath', ''))
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Информация о записи")
+        dialog.setMinimumWidth(400)
+        layout = QVBoxLayout()
+
+        info_text = (
+            f"Файл: {fname}\n"
+            f"Время записи: {meta.get('created_at', '—')}\n"
+            f"Длительность: {meta.get('duration_seconds', 0):.1f} сек\n"
+            f"Частота дискретизации: {meta.get('sample_freq', '—')} Гц\n"
+            f"Каналов: {meta.get('channels', '—')}\n"
+            f"Сэмплов: {meta.get('samples_count', '—')}\n"
+            f"Версия формата: {meta.get('version', '—')}\n"
+            f"\nОписание: {meta.get('notes', '') or '—'}"
+        )
+
+        label = QLabel(info_text)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        btn = QPushButton("Закрыть")
+        btn.clicked.connect(dialog.close)
+        layout.addWidget(btn)
+
+        dialog.setLayout(layout)
+        dialog.exec()
 
     def _on_playback_progress(self, current_sec: float, total_sec: float):
         """Обновление прогресса воспроизведения"""
@@ -644,8 +739,8 @@ class EEGPlotter(QMainWindow):
 
     def _clear_channel_data(self):
         """Очистить буферы каналов"""
-        self.channel1.clear_data()
-        self.channel2.clear_data()
+        for ch in self.channels:
+            ch.clear_data()
 
     def _disable_playback_controls(self):
         """Отключить элементы управления воспроизведением"""
@@ -722,8 +817,9 @@ class EEGPlotter(QMainWindow):
 
     def _update_all_channels(self):
         """Обновление всех графиков по таймеру"""
-        self.channel1.update_display()
-        self.channel2.update_display()
+        for ch in self.channels:
+            if ch.isVisible():
+                ch.update_display()
 
     def closeEvent(self, event):
         """Обработка закрытия окна"""

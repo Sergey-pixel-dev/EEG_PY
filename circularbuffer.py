@@ -3,7 +3,7 @@ class CircularBuffer:
     def __init__(self, size, dtype=object):
         self.point = 0 # индекс элемента, начиная с которого нужно обновлять дальше
         self.size = size
-        self.data = np.empty(size, dtype=dtype)
+        self.data = np.zeros(size, dtype=dtype)
         self._dirty = True
         self._straight_cache = None
     def append(self, item):
@@ -27,7 +27,7 @@ class CircularBuffer:
     def set_size(self, size):
         old_data = self.get_straight_buffer()
         self.size = size
-        self.data = np.empty(size, dtype=self.data.dtype)
+        self.data = np.zeros(size, dtype=self.data.dtype)
         copy_size = min(len(old_data), size)
         self.data[:copy_size] = old_data[:copy_size]
         self.point = min(self.point, size)
