@@ -21,7 +21,8 @@ from data_recorder import DataRecorder
 from playback_worker import PlaybackWorker
 
 PACKET_START = b'\xAA\x55'
-PACKET_SIZE = 8
+NUM_CHANNELS = 3  # <-- меняй здесь количество каналов
+PACKET_SIZE = 2 + NUM_CHANNELS * 2 + 2  # start(2) + channels*uint16(2) + end(2)
 
 MAX_BUFFER_SIZE = 8192
 
@@ -143,7 +144,7 @@ class EEGPlotter(QMainWindow):
         self.serial_worker = None
 
         # Запись
-        self.data_recorder = DataRecorder(self.SAMPLE_FREQ)
+        self.data_recorder = DataRecorder(self.SAMPLE_FREQ, NUM_CHANNELS)
         self.is_recording = False
 
         # Воспроизведение
@@ -153,11 +154,11 @@ class EEGPlotter(QMainWindow):
 
         self._setup_ui()
 
-        # Создаем 2 канала
-        self.channel1 = EEGChannelWidget("Канал 1", self.X_AXIS_RANGE, (0, 3400), self.SAMPLE_FREQ)
-        self.channel2 = EEGChannelWidget("Канал 2", self.X_AXIS_RANGE, (0, 3400), self.SAMPLE_FREQ)
-
-        self.channels = [self.channel1, self.channel2]
+        # Создаем каналы (количество задаётся константой NUM_CHANNELS вверху файла)
+        self.channels = [
+            EEGChannelWidget(f"Канал {i + 1}", self.X_AXIS_RANGE, (0, 3400), self.SAMPLE_FREQ)
+            for i in range(NUM_CHANNELS)
+        ]
 
         self._init_test_data()
 
@@ -172,7 +173,7 @@ class EEGPlotter(QMainWindow):
             self.channel_checks_layout.insertWidget(self.channel_checks_layout.count() - 1, cb)
 
         self.fourier_widget = FourierAnalysisWidget(
-            channels=[self.channel1, self.channel2],
+            channels=self.channels,
             sample_freq=self.SAMPLE_FREQ
         )
         self.tab_widget.addTab(self.fourier_widget, "Фурье-анализ")
@@ -413,10 +414,10 @@ class EEGPlotter(QMainWindow):
     def _init_test_data(self):
         """Инициализация тестовыми синусоидами"""
         x = np.linspace(0, self.X_AXIS_RANGE, self.X_AXIS_RANGE * self.SAMPLE_FREQ)
-        for val in x:
-            self.channel1.append_data(np.sin(val) * 1000 + 1700)
-        for val in x:
-            self.channel2.append_data(np.sin(val * 2) * 800 + 1700)
+        for i, ch in enumerate(self.channels):
+            freq = i + 1
+            for val in x:
+                ch.append_data(np.sin(val * freq) * (1000 - i * 100) + 1700)
 
     def _apply_filter_settings(self):
         """Применение настроек фильтров к обоим каналам"""
@@ -809,8 +810,9 @@ class EEGPlotter(QMainWindow):
     def update_data(self, data):
         """Обновление данных по событию от воркера"""
         if data is not None:
-            self.channel1.append_data(data[1])
-            self.channel2.append_data(data[0])
+            for i, ch in enumerate(self.channels):
+                if i < len(data):
+                    ch.append_data(data[i])
             # Записываем если активна запись (и не в режиме воспроизведения)
             if self.is_recording and not self.playback_mode:
                 self.data_recorder.add_sample(data)
