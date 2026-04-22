@@ -42,6 +42,9 @@ class FourierAnalysisWidget(QWidget):
         self.raw_visible = True
         self.filtered_visible = True
 
+        self.display_unit = 'мкВ'
+        self.display_scale = np.float32(1.0)
+
         self._setup_ui()
 
         self.update_timer = QTimer()
@@ -80,7 +83,7 @@ class FourierAnalysisWidget(QWidget):
 
         self.spectrum_plot_raw = pg.PlotWidget(viewBox=ZoomableViewBox())
         self.spectrum_plot_raw.setBackground('w')
-        self.spectrum_plot_raw.setLabel('left', 'Амплитуда', units='мВ')
+        self.spectrum_plot_raw.setLabel('left', 'Амплитуда', units='мкВ')
         self.spectrum_plot_raw.setLabel('bottom', 'Частота', units='Гц')
         self.spectrum_plot_raw.setTitle('Частотный спектр (до фильтров)')
         self.spectrum_plot_raw.getAxis('left').enableAutoSIPrefix(False)
@@ -104,7 +107,7 @@ class FourierAnalysisWidget(QWidget):
 
         self.spectrum_plot_filtered = pg.PlotWidget(viewBox=ZoomableViewBox())
         self.spectrum_plot_filtered.setBackground('w')
-        self.spectrum_plot_filtered.setLabel('left', 'Амплитуда', units='мВ')
+        self.spectrum_plot_filtered.setLabel('left', 'Амплитуда', units='мкВ')
         self.spectrum_plot_filtered.setLabel('bottom', 'Частота', units='Гц')
         self.spectrum_plot_filtered.setTitle('Частотный спектр (после фильтров)')
         self.spectrum_plot_filtered.getAxis('left').enableAutoSIPrefix(False)
@@ -131,7 +134,7 @@ class FourierAnalysisWidget(QWidget):
         """Создание таблицы гармоник"""
         table = QTableWidget()
         table.setColumnCount(3)
-        table.setHorizontalHeaderLabels(['№', 'Частота (Гц)', 'Амплитуда (мВ)'])
+        table.setHorizontalHeaderLabels(['№', 'Частота (Гц)', 'Амплитуда (мкВ)'])
         table.setRowCount(5)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         table.setMaximumHeight(200)
@@ -160,6 +163,16 @@ class FourierAnalysisWidget(QWidget):
         self.spectrum_plot_filtered.setVisible(checked)
         self.harmonics_label_filtered.setVisible(checked)
         self.harmonics_table_filtered.setVisible(checked)
+
+    def set_display_unit(self, unit: str):
+        """Синхронизировать единицы амплитуды с основным виджетом"""
+        self.display_unit = unit
+        self.display_scale = np.float32(0.001) if unit == 'мВ' else np.float32(1.0)
+        for plot in (self.spectrum_plot_raw, self.spectrum_plot_filtered):
+            plot.setLabel('left', 'Амплитуда', units=unit)
+        header = f'Амплитуда ({unit})'
+        for table in (self.harmonics_table_raw, self.harmonics_table_filtered):
+            table.setHorizontalHeaderItem(2, QTableWidgetItem(header))
 
     def on_channel_changed(self, index):
         """Обработка изменения выбранного канала"""
@@ -201,7 +214,7 @@ class FourierAnalysisWidget(QWidget):
 
         N = len(signal_array)
         fft_values = fft.fft(signal_array)
-        fft_magnitude = 2.0 / N * np.abs(fft_values[:N // 2])
+        fft_magnitude = 2.0 / N * np.abs(fft_values[:N // 2]) * self.display_scale
         frequencies = fft.fftfreq(N, 1 / self.sample_rate)[:N // 2]
 
         start_index = np.searchsorted(frequencies, 1.0)

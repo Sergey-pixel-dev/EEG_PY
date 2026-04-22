@@ -18,7 +18,11 @@ class EEGChannelWidget(QWidget):
         self.sample_freq = sample_freq
 
         self.i = 0  # счетчик для подсчета пропускаемых данных
-        self.n_i = 16  # прореживание: при 2кГц даёт ~125 точек/сек на дисплей
+        self.n_i = max(1, int(sample_freq / 125))  # ~125 точек/сек на дисплей
+
+        # Единицы отображения
+        self.display_unit = 'мкВ'
+        self.display_scale = np.float32(1.0)
 
         # Флаги включения фильтров
         self.notch_enabled = True
@@ -113,7 +117,7 @@ class EEGChannelWidget(QWidget):
             default_y_range=(self.y_range[0], self.y_range[1])
         ))
         self.plot_widget.setBackground('w')
-        self.plot_widget.setLabel('left', self.channel_name, units='мВ')
+        self.plot_widget.setLabel('left', self.channel_name, units='мкВ')
         self.plot_widget.setLabel('bottom', 'Время', units='с')
         self.plot_widget.showGrid(x=True, y=True)
         self.plot_widget.setXRange(0, self.x_range, padding=0)
@@ -128,7 +132,7 @@ class EEGChannelWidget(QWidget):
 
     def update_display(self):
         """Обновление отображения графика"""
-        y = self.data_to_display.get_buffer()
+        y = self.data_to_display.get_buffer() * self.display_scale
         cursor_position = (self.data_to_display.point / self.data_to_display.size) * self.x_range
         gap = self.x_range * 0.008
         cursor_position_with_gap = cursor_position + gap
@@ -202,6 +206,18 @@ class EEGChannelWidget(QWidget):
                 self.data_to_display.append(display_batch[j])
                 self.i = 0
             self.i += 1
+
+    def set_display_unit(self, unit: str):
+        """Переключить единицы отображения: 'мкВ' или 'мВ'"""
+        self.display_unit = unit
+        if unit == 'мВ':
+            self.display_scale = np.float32(0.001)
+            new_range = (self.y_range[0] * 0.001, self.y_range[1] * 0.001)
+        else:
+            self.display_scale = np.float32(1.0)
+            new_range = self.y_range
+        self.plot_widget.setLabel('left', self.channel_name, units=unit)
+        self.plot_widget.setYRange(new_range[0], new_range[1], padding=0)
 
     def clear_data(self):
         """Очистка буферов данных"""

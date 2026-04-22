@@ -58,12 +58,13 @@ class DataRecorder:
         if not self.data_buffer:
             raise ValueError("Нет данных для сохранения")
 
-        # Конвертируем данные в numpy массив
-        data_array = np.array(self.data_buffer, dtype=np.uint16)
+        # Конвертируем данные в numpy массив (float32, значения в мкВ)
+        data_array = np.array(self.data_buffer, dtype=np.float32)
 
         # Создаём метаданные
         metadata = {
-            'version': 2,
+            'version': 3,
+            'data_dtype': 'float32',
             'sample_freq': self.sample_freq,
             'channels': self.channels,
             'created_at': self.start_time.isoformat() if self.start_time else datetime.now().isoformat(),
@@ -113,8 +114,9 @@ class DataRecorder:
             channels = metadata.get('channels', 2)
             samples_count = metadata.get('samples_count', len(data_bytes) // (2 * channels))
 
-            # Конвертируем в numpy
-            data = np.frombuffer(data_bytes, dtype=np.uint16)
+            # Конвертируем в numpy (поддержка старых файлов uint16 и новых float32)
+            dtype = metadata.get('data_dtype', 'uint16')
+            data = np.frombuffer(data_bytes, dtype=np.dtype(dtype))
             data = data.reshape((samples_count, channels))
 
         return data, metadata

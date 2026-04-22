@@ -1,6 +1,7 @@
 import sys
 import time
-from collections import deque
+from enum import IntEnum
+from typing import Optional
 
 import numpy as np
 import pyqtgraph as pg
@@ -20,11 +21,158 @@ from fourier_analysis_widget import FourierAnalysisWidget
 from data_recorder import DataRecorder
 from playback_worker import PlaybackWorker
 
-PACKET_START = b'\xAA\x55'
-NUM_CHANNELS = 3  # <-- меняй здесь количество каналов
-PACKET_SIZE = 2 + NUM_CHANNELS * 2 + 2  # start(2) + channels*uint16(2) + end(2)
+NUM_CHANNELS = 8  # <-- меняй здесь количество каналов
+BYTES_PER_CHANNEL = 3  # 24-битное знаковое целое в мкВ
 
-MAX_BUFFER_SIZE = 8192
+# Типы пакетов SerProt
+TYPE_COMMAND  = 0xCC  # Master → Slave (зарезервировано)
+TYPE_RESPONSE = 0xDD  # Slave → Master (зарезервировано)
+TYPE_ERROR    = 0xEE  # Slave → Master (зарезервировано)
+TYPE_PUSH     = 0xFF  # Slave → Master, стриминговые данные
+
+_VALID_TYPES = {TYPE_COMMAND, TYPE_RESPONSE, TYPE_ERROR, TYPE_PUSH}
+
+
+def crc16_modbus(data: bytes) -> int:
+    """CRC-16/Modbus: полином 0x8005 (reflected 0xA001), init=0xFFFF, покрывает [type][seq][payload]"""
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            if crc & 0x0001:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return crc
+
+
+class _S(IntEnum):
+    S0     = 0  # ожидание 0xAA (старт)
+    S0_ESC = 7  # в S0 получен 0xBB — следующий байт литерал, не маркер
+    S1     = 1  # получен 0xAA, ждём type
+    S2     = 2  # получен type, ждём seq
+    S3     = 3  # получен seq, ждём 1-й escaped-байт
+    S4     = 4  # получен 1-й байт, ждём 2-й (гарантия ≥ 2 байт для CRC)
+    S5     = 5  # накапливаем payload+CRC до end-маркера 0xAA
+    SESC   = 6  # получен 0xBB, следующий байт — литерал
+
+
+class SerProtParser:
+    """Конечный автомат разбора пакетов SerProt (по Machine_state_parser.csv)."""
+
+    def __init__(self, num_channels: int, bytes_per_channel: int):
+        self.num_channels = num_channels
+        self.bytes_per_channel = bytes_per_channel
+        self._state = _S.S0
+        self._type = 0
+        self._seq = 0
+        self._esc_return: _S = _S.S3
+        self._buf = bytearray()
+        self._last_push_seq: Optional[int] = None
+
+    def process_byte(self, b: int) -> Optional[np.ndarray]:
+        s = self._state
+
+        if s == _S.S0:
+            if b == 0xAA:
+                self._state = _S.S1
+            elif b == 0xBB:
+                self._state = _S.S0_ESC  # escape-префикс: следующий байт — литерал
+
+        elif s == _S.S0_ESC:
+            self._state = _S.S0  # пропускаем литерал (0xAA или 0xBB), ищем дальше
+
+        elif s == _S.S1:
+            if b == 0xAA:
+                pass  # повторный 0xAA = новый старт-маркер, остаёмся в S1
+            elif b in _VALID_TYPES:
+                self._type = b
+                self._state = _S.S2
+            else:
+                self._state = _S.S0
+
+        elif s == _S.S2:
+            self._seq = b
+            self._buf = bytearray()
+            self._state = _S.S3
+
+        elif s == _S.S3:
+            if b == 0xAA:
+                self._state = _S.S0          # слишком короткий
+            elif b == 0xBB:
+                self._esc_return = _S.S4
+                self._state = _S.SESC
+            else:
+                self._buf.append(b)
+                self._state = _S.S4
+
+        elif s == _S.S4:
+            if b == 0xAA:
+                self._state = _S.S0          # нужны ≥ 2 байта (CRC_L + CRC_H)
+            elif b == 0xBB:
+                self._esc_return = _S.S5
+                self._state = _S.SESC
+            else:
+                self._buf.append(b)
+                self._state = _S.S5
+
+        elif s == _S.S5:
+            if b == 0xAA:
+                self._state = _S.S0
+                return self._finalize()
+            elif b == 0xBB:
+                self._esc_return = _S.S5
+                self._state = _S.SESC
+            else:
+                self._buf.append(b)
+
+        elif s == _S.SESC:
+            if b == 0xAA or b == 0xBB:
+                self._buf.append(b)
+                self._state = self._esc_return
+            else:
+                self._state = _S.S0          # недопустимый байт после escape
+
+        return None
+
+    def _finalize(self) -> Optional[np.ndarray]:
+        buf = self._buf
+        if len(buf) < 2:
+            return None
+
+        crc_received = buf[-2] | (buf[-1] << 8)
+        payload = bytes(buf[:-2])
+
+        crc_check = bytes([self._type, self._seq]) + payload
+        if crc16_modbus(crc_check) != crc_received:
+            print(f"[SerProt] CRC mismatch (type=0x{self._type:02X} seq={self._seq})")
+            return None
+
+        if self._type != TYPE_PUSH:
+            return None  # Response/Error/Command — обработка в будущем
+
+        expected_payload = self.num_channels * self.bytes_per_channel
+        if len(payload) != expected_payload:
+            print(f"[SerProt] Push payload size {len(payload)} != {expected_payload}")
+            return None
+
+        # Детектирование потерь пакетов по seq
+        if self._last_push_seq is not None:
+            expected_seq = (self._last_push_seq + 1) & 0xFF
+            if self._seq != expected_seq:
+                missed = (self._seq - expected_seq) & 0xFF
+                print(f"[WARN] Push seq loss: missed {missed} (got {self._seq}, expected {expected_seq})")
+        self._last_push_seq = self._seq
+
+        # Декодирование 8 каналов × 3 байта LE signed → мкВ
+        data = np.empty(self.num_channels, dtype=np.float32)
+        for i in range(self.num_channels):
+            off = i * self.bytes_per_channel
+            raw = payload[off] | (payload[off + 1] << 8) | (payload[off + 2] << 16)
+            if raw >= 0x800000:
+                raw -= 0x1000000
+            data[i] = float(raw)
+        return data
 
 
 class SerialWorker(QThread):
@@ -34,14 +182,12 @@ class SerialWorker(QThread):
         super().__init__()
         self.sport = sport
         self.running = False
-        self.rxBuf = bytearray(MAX_BUFFER_SIZE)  # ИЗМЕНЕНО на bytearray для скорости
-        self.buf_pos = 0
+        self.parser = SerProtParser(NUM_CHANNELS, BYTES_PER_CHANNEL)
 
         # Профилирование
         self.packet_count = 0
         self.last_time = time.perf_counter()
         self.last_print_time = self.last_time
-        self.parse_times = []
 
     def run(self):
         self.running = True
@@ -55,68 +201,21 @@ class SerialWorker(QThread):
                 bytes_waiting = self.sport.in_waiting
                 if bytes_waiting > 0:
                     raw_data = self.sport.read(min(bytes_waiting, 512))
+                    for b in raw_data:
+                        result = self.parser.process_byte(b)
+                        if result is not None:
+                            self.packet_count += 1
+                            self.data_received.emit(result)
 
-                    bytes_to_add = len(raw_data)
-                    if self.buf_pos + bytes_to_add >= MAX_BUFFER_SIZE:
-                        valid_data = self.rxBuf[self.buf_pos:]
-                        self.rxBuf[:len(valid_data)] = valid_data
-                        self.buf_pos = len(valid_data)
-
-                    self.rxBuf[self.buf_pos:self.buf_pos + bytes_to_add] = raw_data
-                    self.buf_pos += bytes_to_add
-
-                    search_pos = 0
-                    while True:
-                        start_idx = self.rxBuf.find(PACKET_START, search_pos, self.buf_pos)
-                        if start_idx == -1:
-                            search_pos = self.buf_pos
-                            break
-                        if self.buf_pos - start_idx < PACKET_SIZE:
-                            break
-                        end_idx = start_idx + PACKET_SIZE - 1
-                        if not (self.rxBuf[end_idx - 1] == 0x55 and self.rxBuf[end_idx] == 0xAA):
-                            search_pos = start_idx + 1
-                            continue
-                        parse_start = time.perf_counter()
-                        packet = bytes(self.rxBuf[start_idx:start_idx + PACKET_SIZE])
-
-                        data = np.zeros(PACKET_SIZE // 2 - 2, dtype=np.uint16)
-                        for i in range(PACKET_SIZE // 2 - 2):
-                            data[i] = packet[2 * i + 2] | (packet[2 * i + 3] << 8)
-
-                        parse_time = (time.perf_counter() - parse_start) * 1000
-                        self.parse_times.append(parse_time)
-
-                        self.packet_count += 1
-                        current_time = time.perf_counter()
-
-                        if current_time - self.last_print_time >= 1.0:
-                            elapsed = current_time - self.last_time
-                            packet_rate = self.packet_count / elapsed
-                            avg_parse_time = np.mean(self.parse_times[-100:]) if self.parse_times else 0
-                            max_parse_time = np.max(self.parse_times[-100:]) if self.parse_times else 0
-
-                            print(f"[{time.strftime('%H:%M:%S.%f')[:-3]}] "
-                                  f"Пакетов: {self.packet_count} | "
-                                  f"Скорость: {packet_rate:.1f} пак/сек | "
-                                  f"Мин.вреемя парсинга: {np.min(self.parse_times[-100:]):.3f}мс | "
-                                  f"Макс.время парсинга: {max_parse_time:.3f}мс | "
-                                  f"Среднее: {avg_parse_time:.3f}мс")
-
-                            self.last_print_time = current_time
-                        search_pos = start_idx + PACKET_SIZE
-                        self.data_received.emit(data)
-
-                    # Сдвигаем буфер только один раз после обработки всех пакетов
-                    if search_pos > 0 and search_pos < self.buf_pos:
-                        remaining = self.buf_pos - search_pos
-                        self.rxBuf[0:remaining] = self.rxBuf[search_pos:self.buf_pos]
-                        self.buf_pos = remaining
-                    elif search_pos >= self.buf_pos:
-                        self.buf_pos = 0
+                    current_time = time.perf_counter()
+                    if current_time - self.last_print_time >= 1.0:
+                        elapsed = current_time - self.last_time
+                        print(f"[{time.strftime('%H:%M:%S.%f')[:-3]}] "
+                              f"Пакетов: {self.packet_count} | "
+                              f"Скорость: {self.packet_count / elapsed:.1f} пак/сек")
+                        self.last_print_time = current_time
                 else:
-                    # Нет данных - немного спим чтобы не грузить CPU
-                    time.sleep(0.0001)  # 0.1 мс
+                    time.sleep(0.0001)
 
             except Exception as e:
                 print(f"[{time.strftime('%H:%M:%S')}] Ошибка: {e}")
@@ -135,11 +234,11 @@ class EEGPlotter(QMainWindow):
         self.setWindowTitle("ЭЭГ")
         self.setGeometry(100, 100, 1400, 800)
 
-        self.BAUD_RATE = 1500000
+        self.BAUD_RATE = 2000000  # MCU: APB1=45MHz, BRR=23 → ~1.957 Мбод
         self.sport = serial.Serial(None, self.BAUD_RATE)
 
         self.X_AXIS_RANGE = 8  # в сек.
-        self.SAMPLE_FREQ = 2000  # Гц
+        self.SAMPLE_FREQ = 2048  # Гц
 
         self.serial_worker = None
 
@@ -156,21 +255,24 @@ class EEGPlotter(QMainWindow):
 
         # Создаем каналы (количество задаётся константой NUM_CHANNELS вверху файла)
         self.channels = [
-            EEGChannelWidget(f"Канал {i + 1}", self.X_AXIS_RANGE, (0, 3400), self.SAMPLE_FREQ)
+            EEGChannelWidget(f"Канал {i + 1}", self.X_AXIS_RANGE, (-500, 500), self.SAMPLE_FREQ)
             for i in range(NUM_CHANNELS)
         ]
 
         self._init_test_data()
 
+        self.channel_checkboxes = []
         for i, ch in enumerate(self.channels):
             ch.setMinimumHeight(250)
             ch.setMaximumHeight(500)
             self.graph_layout.addWidget(ch)
 
             cb = QCheckBox(f"Канал {i + 1}")
-            cb.setChecked(True)
+            cb.setChecked(i == 0)
+            ch.setVisible(i == 0)
             cb.toggled.connect(lambda checked, c=ch: c.setVisible(checked))
             self.channel_checks_layout.insertWidget(self.channel_checks_layout.count() - 1, cb)
+            self.channel_checkboxes.append(cb)
 
         self.fourier_widget = FourierAnalysisWidget(
             channels=self.channels,
@@ -227,6 +329,16 @@ class EEGPlotter(QMainWindow):
         self.record_btn.setEnabled(False)
         self.record_btn.setStyleSheet("QPushButton:checked { background-color: #ff4444; color: white; }")
         toolbar.addWidget(self.record_btn)
+
+        toolbar.addSeparator()
+
+        # Выбор единиц отображения мкВ / мВ
+        toolbar.addWidget(QLabel("Единицы:"))
+        self.unit_combo = QComboBox()
+        self.unit_combo.addItems(["мкВ", "мВ"])
+        self.unit_combo.setToolTip("Единицы отображения амплитуды")
+        self.unit_combo.currentTextChanged.connect(self._toggle_display_unit)
+        toolbar.addWidget(self.unit_combo)
 
         toolbar.addSeparator()
 
@@ -399,6 +511,12 @@ class EEGPlotter(QMainWindow):
         self.tab_settings.setLayout(settings_layout)
         self.tab_widget.addTab(self.tab_settings, "Настройки")
 
+    def _toggle_display_unit(self, unit: str):
+        """Переключить единицы отображения всех каналов: мкВ / мВ"""
+        for ch in self.channels:
+            ch.set_display_unit(unit)
+        self.fourier_widget.set_display_unit(unit)
+
     def _refresh_ports(self):
         """Обновление списка доступных портов"""
         current_port = self.port_combo.currentText()
@@ -412,12 +530,13 @@ class EEGPlotter(QMainWindow):
             self.port_combo.setCurrentIndex(index)
 
     def _init_test_data(self):
-        """Инициализация тестовыми синусоидами"""
+        """Инициализация тестовыми синусоидами (в мкВ)"""
         x = np.linspace(0, self.X_AXIS_RANGE, self.X_AXIS_RANGE * self.SAMPLE_FREQ)
         for i, ch in enumerate(self.channels):
             freq = i + 1
+            amplitude = 200 - i * 20  # от 200 до 60 мкВ
             for val in x:
-                ch.append_data(np.sin(val * freq) * (1000 - i * 100) + 1700)
+                ch.append_data(np.sin(2 * np.pi * val * freq) * amplitude)
 
     def _apply_filter_settings(self):
         """Применение настроек фильтров к обоим каналам"""
@@ -810,8 +929,9 @@ class EEGPlotter(QMainWindow):
     def update_data(self, data):
         """Обновление данных по событию от воркера"""
         if data is not None:
+            fft_ch = self.fourier_widget.selected_channel_index
             for i, ch in enumerate(self.channels):
-                if i < len(data):
+                if i < len(data) and (self.channel_checkboxes[i].isChecked() or i == fft_ch):
                     ch.append_data(data[i])
             # Записываем если активна запись (и не в режиме воспроизведения)
             if self.is_recording and not self.playback_mode:
