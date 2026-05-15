@@ -1,21 +1,15 @@
-,,,,,,,,,,Состояния,Входной Байт,,,
-,0xAA,,,,,,,,,,0xAA,0xBB,Type,Other
-,,,,,,,,,,S0,S1,S0,S0,S0
-,,,,,,,,,,S1,S0 (Error),S0 (Error),"S2 (запоминаем
-В переменную)",S0 (Error)
-,,,,,,,,,,S2,"S3 (запоминаем
-В переменную)","S3 (запоминаем
-В переменную)","S3 (запоминаем
-В переменную)","S3 (запоминаем
-В переменную)"
-,,,,,,,,,,S3,S0 (Error),"Sesc (кладем в стек
-S4 состояние)",S4,S4
-,,,,,,,,,,S4,S0 (Error),"Sesc (кладем в стек
-S5 состояние)",S5,S5
-,,,,,,,,,,S5,"S0 (Succes,
-Вызываем обработчик
-По сохранненому type","Sesc (кладем в стек
-S5 состояние)",S5 (накапливаем),S5 (накапливаем)
-,,,,,,,,,,Sesc,"Переходим на состояние
-Из стека (накапливаем)","Переходим на состояние
-Из стека (накапливаем)",S0 (Error),SO (Error)
+Состояние;0xAA;0xBB;Другой байт;Примечание / Действие
+S0_WAIT_START;S1_TYPE;S0_WAIT_START;S0_WAIT_START;Ожидание стартового маркера 0xAA. Все байты до него игнорируются.
+S1_TYPE;S2_SEQ;S2_SEQ;S2_SEQ;Чтение Type. Любой байт валиден (включая 0xAA, 0xBB), не экранируется.
+S2_SEQ;S3_LEN_L;S3_LEN_L;S3_LEN_L;Чтение Seq. Любой байт валиден, не экранируется.
+S3_LEN_L;S4_LEN_H;S4_LEN_H;S4_LEN_H;Чтение младшего байта длины (len_l). Сохраняем для вычисления total_len.
+S4_LEN_H;S5_PAYLOAD*;S5_PAYLOAD*;S5_PAYLOAD*;"Чтение старшего байта длины (len_h).
+ *Если total_len == 0 -> S6_CRC_L, иначе → S5_PAYLOAD с cnt = total_len."
+S5_PAYLOAD;"S5 (cnt-1, накопить; если cnt==0 → S6_CRC_L)";S_ESC_PAYLOAD;"S5 (cnt-1, накопить; если cnt==0 → S6_CRC_L)";Накопление payload. При 0xBB — уход в escape без изменения счётчика. При исчерпании cnt — переход к CRC.
+S6_CRC_L;S7_CRC_H (CRC_L=0xAA);S_ESC_CRC_L;S7_CRC_H (накопить CRC_L);Чтение младшего байта CRC. При 0xBB — escape-обработка.
+S7_CRC_H;S0_VERIFY (CRC_H=0xAA);S_ESC_CRC_H;S0_VERIFY (CRC_H=байт);Чтение старшего байта CRC. После накопления — переход к проверке CRC и сбросу автомата.
+S_ESC_PAYLOAD;"S5 (cnt-1, литерал 0xAA; если cnt==0 → S6)";"S5 (cnt-1, литерал 0xBB; если cnt==0 → S6)";S0_WAIT_START (ERROR: неверный escape);Обработка escape в payload. Записываем литерал, декремент cnt.
+S_ESC_CRC_L;S7_CRC_H (CRC_L=0xAA);S7_CRC_H (CRC_L=0xBB);S0_WAIT_START (ERROR);Обработка escape в CRC_L. Записываем литерал, переход к CRC_H.
+S_ESC_CRC_H;S0_VERIFY (CRC_H=0xAA);S0_VERIFY (CRC_H=0xBB);S0_WAIT_START (ERROR);Обработка escape в CRC_H. Записываем литерал, переход к проверке CRC.
+S0_VERIFY;S1_TYPE (если следующий байт 0xAA — старт нового пакета);S0_WAIT_START;S0_WAIT_START;"Проверка CRC16. При OK — вызов обработчика. При FAIL — сброс.
+ Если следующий байт уже 0xAA — можно сразу начать S1_TYPE."

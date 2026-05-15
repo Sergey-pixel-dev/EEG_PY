@@ -100,8 +100,8 @@ class EEGChannelWidget(QWidget):
             dtype=np.float32
         )
 
-        # Батч-буфер для фильтрации
-        self.batch_size = 20
+        # Батч-буфер для фильтрации (уменьшен для плавности на низких частотах)
+        self.batch_size = 1
         self.batch_buffer = []
 
         self.curve = None

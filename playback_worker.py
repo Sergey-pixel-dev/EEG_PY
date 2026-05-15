@@ -25,6 +25,7 @@ class PlaybackWorker(QThread):
         self.data: Optional[np.ndarray] = None
         self.metadata: Optional[dict] = None
         self.sample_freq = 2000
+        self.active_channels: list[int] = []
         self.running = False
         self.paused = False
         self.current_index = 0
@@ -35,6 +36,7 @@ class PlaybackWorker(QThread):
         """Загрузить файл записи"""
         self.data, self.metadata = DataRecorder.load(filepath)
         self.sample_freq = self.metadata.get('sample_freq', 2000)
+        self.active_channels = self.metadata.get('active_channels', list(range(self.metadata.get('channels', 2))))
         self.current_index = 0
 
     def get_duration(self) -> float:
@@ -46,6 +48,10 @@ class PlaybackWorker(QThread):
     def get_metadata(self) -> Optional[dict]:
         """Получить метаданные загруженного файла"""
         return self.metadata
+
+    def get_active_channels(self) -> list[int]:
+        """Получить список активных каналов из файла"""
+        return self.active_channels
 
     def run(self):
         """Основной цикл воспроизведения"""

@@ -1,6 +1,5 @@
 import sys
 import time
-from enum import IntEnum
 from typing import Optional
 
 import numpy as np
@@ -20,171 +19,25 @@ from eeg_channel_widget import EEGChannelWidget
 from fourier_analysis_widget import FourierAnalysisWidget
 from data_recorder import DataRecorder
 from playback_worker import PlaybackWorker
+from protocol import SerProtParser, SerProtMaster, SerProtFrame
 
-NUM_CHANNELS = 8  # <-- меняй здесь количество каналов
-BYTES_PER_CHANNEL = 3  # 24-битное знаковое целое в мкВ
+NUM_CHANNELS = 8
+BYTES_PER_CHANNEL = 3
 
-# Типы пакетов SerProt
-TYPE_COMMAND  = 0xCC  # Master → Slave (зарезервировано)
-TYPE_RESPONSE = 0xDD  # Slave → Master (зарезервировано)
-TYPE_ERROR    = 0xEE  # Slave → Master (зарезервировано)
-TYPE_PUSH     = 0xFF  # Slave → Master, стриминговые данные
-
-_VALID_TYPES = {TYPE_COMMAND, TYPE_RESPONSE, TYPE_ERROR, TYPE_PUSH}
-
-
-def crc16_modbus(data: bytes) -> int:
-    """CRC-16/Modbus: полином 0x8005 (reflected 0xA001), init=0xFFFF, покрывает [type][seq][payload]"""
-    crc = 0xFFFF
-    for b in data:
-        crc ^= b
-        for _ in range(8):
-            if crc & 0x0001:
-                crc = (crc >> 1) ^ 0xA001
-            else:
-                crc >>= 1
-    return crc
-
-
-class _S(IntEnum):
-    S0     = 0  # ожидание 0xAA (старт)
-    S0_ESC = 7  # в S0 получен 0xBB — следующий байт литерал, не маркер
-    S1     = 1  # получен 0xAA, ждём type
-    S2     = 2  # получен type, ждём seq
-    S3     = 3  # получен seq, ждём 1-й escaped-байт
-    S4     = 4  # получен 1-й байт, ждём 2-й (гарантия ≥ 2 байт для CRC)
-    S5     = 5  # накапливаем payload+CRC до end-маркера 0xAA
-    SESC   = 6  # получен 0xBB, следующий байт — литерал
-
-
-class SerProtParser:
-    """Конечный автомат разбора пакетов SerProt (по Machine_state_parser.csv)."""
-
-    def __init__(self, num_channels: int, bytes_per_channel: int):
-        self.num_channels = num_channels
-        self.bytes_per_channel = bytes_per_channel
-        self._state = _S.S0
-        self._type = 0
-        self._seq = 0
-        self._esc_return: _S = _S.S3
-        self._buf = bytearray()
-        self._last_push_seq: Optional[int] = None
-
-    def process_byte(self, b: int) -> Optional[np.ndarray]:
-        s = self._state
-
-        if s == _S.S0:
-            if b == 0xAA:
-                self._state = _S.S1
-            elif b == 0xBB:
-                self._state = _S.S0_ESC  # escape-префикс: следующий байт — литерал
-
-        elif s == _S.S0_ESC:
-            self._state = _S.S0  # пропускаем литерал (0xAA или 0xBB), ищем дальше
-
-        elif s == _S.S1:
-            if b == 0xAA:
-                pass  # повторный 0xAA = новый старт-маркер, остаёмся в S1
-            elif b in _VALID_TYPES:
-                self._type = b
-                self._state = _S.S2
-            else:
-                self._state = _S.S0
-
-        elif s == _S.S2:
-            self._seq = b
-            self._buf = bytearray()
-            self._state = _S.S3
-
-        elif s == _S.S3:
-            if b == 0xAA:
-                self._state = _S.S0          # слишком короткий
-            elif b == 0xBB:
-                self._esc_return = _S.S4
-                self._state = _S.SESC
-            else:
-                self._buf.append(b)
-                self._state = _S.S4
-
-        elif s == _S.S4:
-            if b == 0xAA:
-                self._state = _S.S0          # нужны ≥ 2 байта (CRC_L + CRC_H)
-            elif b == 0xBB:
-                self._esc_return = _S.S5
-                self._state = _S.SESC
-            else:
-                self._buf.append(b)
-                self._state = _S.S5
-
-        elif s == _S.S5:
-            if b == 0xAA:
-                self._state = _S.S0
-                return self._finalize()
-            elif b == 0xBB:
-                self._esc_return = _S.S5
-                self._state = _S.SESC
-            else:
-                self._buf.append(b)
-
-        elif s == _S.SESC:
-            if b == 0xAA or b == 0xBB:
-                self._buf.append(b)
-                self._state = self._esc_return
-            else:
-                self._state = _S.S0          # недопустимый байт после escape
-
-        return None
-
-    def _finalize(self) -> Optional[np.ndarray]:
-        buf = self._buf
-        if len(buf) < 2:
-            return None
-
-        crc_received = buf[-2] | (buf[-1] << 8)
-        payload = bytes(buf[:-2])
-
-        crc_check = bytes([self._type, self._seq]) + payload
-        if crc16_modbus(crc_check) != crc_received:
-            print(f"[SerProt] CRC mismatch (type=0x{self._type:02X} seq={self._seq})")
-            return None
-
-        if self._type != TYPE_PUSH:
-            return None  # Response/Error/Command — обработка в будущем
-
-        expected_payload = self.num_channels * self.bytes_per_channel
-        if len(payload) != expected_payload:
-            print(f"[SerProt] Push payload size {len(payload)} != {expected_payload}")
-            return None
-
-        # Детектирование потерь пакетов по seq
-        if self._last_push_seq is not None:
-            expected_seq = (self._last_push_seq + 1) & 0xFF
-            if self._seq != expected_seq:
-                missed = (self._seq - expected_seq) & 0xFF
-                print(f"[WARN] Push seq loss: missed {missed} (got {self._seq}, expected {expected_seq})")
-        self._last_push_seq = self._seq
-
-        # Декодирование 8 каналов × 3 байта LE signed → мкВ
-        data = np.empty(self.num_channels, dtype=np.float32)
-        for i in range(self.num_channels):
-            off = i * self.bytes_per_channel
-            raw = payload[off] | (payload[off + 1] << 8) | (payload[off + 2] << 16)
-            if raw >= 0x800000:
-                raw -= 0x1000000
-            data[i] = float(raw)
-        return data
+TYPE_PUSH = 0xFF
 
 
 class SerialWorker(QThread):
     data_received = pyqtSignal(np.ndarray)
+    response_received = pyqtSignal(int, int, bytes)  # type, seq, payload
 
     def __init__(self, sport):
         super().__init__()
         self.sport = sport
         self.running = False
-        self.parser = SerProtParser(NUM_CHANNELS, BYTES_PER_CHANNEL)
+        self.parser = SerProtParser()
 
-        # Профилирование
+        # Профилирование — скорость за последнюю секунду
         self.packet_count = 0
         self.last_time = time.perf_counter()
         self.last_print_time = self.last_time
@@ -198,28 +51,38 @@ class SerialWorker(QThread):
 
         while self.running:
             try:
-                bytes_waiting = self.sport.in_waiting
-                if bytes_waiting > 0:
-                    raw_data = self.sport.read(min(bytes_waiting, 512))
+                # Агрессивный polling без sleep — критично для 2 Мбод
+                raw_data = self.sport.read(4096)
+                if raw_data:
                     for b in raw_data:
-                        result = self.parser.process_byte(b)
-                        if result is not None:
-                            self.packet_count += 1
-                            self.data_received.emit(result)
+                        frame = self.parser.process_byte(b)
+                        if frame is not None:
+                            if frame.type == TYPE_PUSH:
+                                samples = SerProtMaster.decode_adc_samples(frame.payload)
+                                self.packet_count += 1
+                                self.data_received.emit(np.array(samples, dtype=np.float32))
+                            elif frame.type in (SerProtMaster.TYPE_RESPONSE, SerProtMaster.TYPE_ERROR):
+                                self.response_received.emit(frame.type, frame.seq, frame.payload)
 
                     current_time = time.perf_counter()
                     if current_time - self.last_print_time >= 1.0:
-                        elapsed = current_time - self.last_time
+                        elapsed = current_time - self.last_print_time
+                        rate = self.packet_count / elapsed if elapsed > 0 else 0
                         print(f"[{time.strftime('%H:%M:%S.%f')[:-3]}] "
                               f"Пакетов: {self.packet_count} | "
-                              f"Скорость: {self.packet_count / elapsed:.1f} пак/сек")
+                              f"Скорость: {rate:.1f} пак/сек")
+                        self.packet_count = 0
                         self.last_print_time = current_time
-                else:
-                    time.sleep(0.0001)
 
             except Exception as e:
                 print(f"[{time.strftime('%H:%M:%S')}] Ошибка: {e}")
                 self.running = False
+
+    def reset_stats(self):
+        """Сбросить счётчики пакетов (при смене конфигурации)."""
+        self.packet_count = 0
+        self.last_time = time.perf_counter()
+        self.last_print_time = self.last_time
 
     def stop(self):
         print(f"[{time.strftime('%H:%M:%S')}] SerialWorker останавливается. "
@@ -234,16 +97,29 @@ class EEGPlotter(QMainWindow):
         self.setWindowTitle("ЭЭГ")
         self.setGeometry(100, 100, 1400, 800)
 
-        self.BAUD_RATE = 2000000  # MCU: APB1=45MHz, BRR=23 → ~1.957 Мбод
-        self.sport = serial.Serial(None, self.BAUD_RATE)
+        self.BAUD_RATE = 921600  # FT232R стабилен на 921600, не на 2M
+        self.sport = None
 
         self.X_AXIS_RANGE = 8  # в сек.
-        self.SAMPLE_FREQ = 2048  # Гц
+        self.SAMPLE_FREQ = 250  # Гц (по умолчанию)
 
         self.serial_worker = None
+        self.serprot = SerProtMaster()
+
+        # Активные каналы (по умолчанию только канал 0)
+        self.active_channels = [0]
+
+        # Ожидание ответа на команду
+        self._pending_cmd_seq: Optional[int] = None
+        self._pending_cmd_name: str = ""
+        self._pending_cmd_time: float = 0.0
+        self._after_response_callback = None
+        self._cmd_timeout_timer = QTimer()
+        self._cmd_timeout_timer.timeout.connect(self._check_cmd_timeout)
+        self._cmd_timeout_timer.setInterval(100)  # 100 мс
 
         # Запись
-        self.data_recorder = DataRecorder(self.SAMPLE_FREQ, NUM_CHANNELS)
+        self.data_recorder = DataRecorder(self.SAMPLE_FREQ, self.active_channels)
         self.is_recording = False
 
         # Воспроизведение
@@ -270,7 +146,7 @@ class EEGPlotter(QMainWindow):
             cb = QCheckBox(f"Канал {i + 1}")
             cb.setChecked(i == 0)
             ch.setVisible(i == 0)
-            cb.toggled.connect(lambda checked, c=ch: c.setVisible(checked))
+            cb.toggled.connect(lambda checked, idx=i: self._on_channel_toggled(idx, checked))
             self.channel_checks_layout.insertWidget(self.channel_checks_layout.count() - 1, cb)
             self.channel_checkboxes.append(cb)
 
@@ -339,6 +215,35 @@ class EEGPlotter(QMainWindow):
         self.unit_combo.setToolTip("Единицы отображения амплитуды")
         self.unit_combo.currentTextChanged.connect(self._toggle_display_unit)
         toolbar.addWidget(self.unit_combo)
+
+        toolbar.addSeparator()
+
+        # Частота дискретизации
+        toolbar.addWidget(QLabel("Частота:"))
+        self.samplerate_combo = QComboBox()
+        self.samplerate_combo.addItems(["250 Гц", "500 Гц", "1 кГц", "4 кГц"])
+        self.samplerate_combo.setCurrentIndex(0)  # 250 Гц по умолчанию
+        self.samplerate_combo.currentIndexChanged.connect(self._on_samplerate_changed)
+        toolbar.addWidget(self.samplerate_combo)
+
+        toolbar.addSeparator()
+
+        # Опорное напряжение
+        toolbar.addWidget(QLabel("Vref:"))
+        self.vref_spin = QSpinBox()
+        self.vref_spin.setRange(0, 3300)
+        self.vref_spin.setValue(1000)
+        self.vref_spin.setSuffix(" мВ")
+        self.vref_spin.setSingleStep(100)
+        self.vref_spin.valueChanged.connect(self._on_vref_changed)
+        toolbar.addWidget(self.vref_spin)
+
+        toolbar.addSeparator()
+
+        # Статус / ошибки
+        self.status_label = QLabel("Не подключено")
+        self.status_label.setStyleSheet("color: gray;")
+        toolbar.addWidget(self.status_label)
 
         toolbar.addSeparator()
 
@@ -516,6 +421,163 @@ class EEGPlotter(QMainWindow):
         for ch in self.channels:
             ch.set_display_unit(unit)
         self.fourier_widget.set_display_unit(unit)
+
+    # ==================== Команды к MCU ====================
+
+    def _send_command(self, cmd_id: int, payload: bytes = b"", cmd_name: str = "", on_response=None):
+        """Отправить команду через SerProt, если порт открыт. Ожидать ответ 100 мс."""
+        if self.sport and self.sport.is_open:
+            frame = self.serprot.build_command(cmd_id, payload)
+            self.sport.write(frame)
+            self.sport.flush()
+            self._pending_cmd_seq = self.serprot._seq - 1  # seq уже инкрементирован
+            self._pending_cmd_name = cmd_name or f"cmd=0x{cmd_id:02X}"
+            self._pending_cmd_time = time.perf_counter()
+            self._after_response_callback = on_response
+            self._cmd_timeout_timer.start()
+            print(f"[TX] {frame.hex()}  (seq={self._pending_cmd_seq:02X}, {self._pending_cmd_name})")
+            self.status_label.setText(f"Ожидание: {self._pending_cmd_name}...")
+            self.status_label.setStyleSheet("color: orange;")
+
+    def _send_start_stream(self, on_response=None):
+        """Отправить команду старта стриминга с активными каналами."""
+        payload = bytes([len(self.active_channels)] + self.active_channels)
+        self._send_command(0x01, payload, cmd_name="StartStream", on_response=on_response)
+        print(f"[CMD] Start stream: channels={self.active_channels}")
+
+    def _send_stop_stream(self, on_response=None):
+        """Отправить команду остановки стриминга."""
+        self._send_command(0x02, cmd_name="StopStream", on_response=on_response)
+        print("[CMD] Stop stream")
+
+    def _send_set_vref(self, mv: int):
+        """Отправить команду установки опорного напряжения."""
+        payload = bytes([mv & 0xFF, (mv >> 8) & 0xFF])
+        self._send_command(0x10, payload, cmd_name="SetVref")
+        print(f"[CMD] Set Vref: {mv} mV")
+
+    def _send_set_samplerate(self, idx: int, on_response=None):
+        """Отправить команду установки частоты дискретизации."""
+        self._send_command(0x11, bytes([idx]), cmd_name="SetSamplerate", on_response=on_response)
+        freq_map = {0: 250, 1: 500, 2: 1000, 3: 4000}
+        print(f"[CMD] Set samplerate: {freq_map.get(idx, '?')} Hz (idx={idx})")
+
+    def _check_cmd_timeout(self):
+        """Проверить таймаут ответа на команду."""
+        if self._pending_cmd_seq is None:
+            self._cmd_timeout_timer.stop()
+            return
+        elapsed = (time.perf_counter() - self._pending_cmd_time) * 1000
+        if elapsed > 100:  # 100 мс таймаут
+            self._cmd_timeout_timer.stop()
+            print(f"[TIMEOUT] Команда {self._pending_cmd_name} (seq={self._pending_cmd_seq:02X}) — нет ответа за {elapsed:.0f} мс")
+            self.status_label.setText(f"ОШИБКА: таймаут {self._pending_cmd_name}")
+            self.status_label.setStyleSheet("color: red;")
+            self._pending_cmd_seq = None
+            self._after_response_callback = None
+
+    def _on_response_received(self, type_byte: int, seq: int, payload: bytes):
+        """Обработка Response (0xDD) или Error (0xEE) от MCU."""
+        self._cmd_timeout_timer.stop()
+        matched = False
+        if type_byte == SerProtMaster.TYPE_RESPONSE:
+            print(f"[RX] Response seq={seq:02X} len={len(payload)} {payload.hex()}")
+            if self._pending_cmd_seq is not None and seq == self._pending_cmd_seq:
+                matched = True
+                self.status_label.setText("OK: " + self._pending_cmd_name)
+                self.status_label.setStyleSheet("color: green;")
+                self._pending_cmd_seq = None
+            else:
+                self.status_label.setText(f"Response seq={seq:02X}")
+                self.status_label.setStyleSheet("color: green;")
+        elif type_byte == SerProtMaster.TYPE_ERROR:
+            error_code = payload[0] if payload else 0xFF
+            error_names = {
+                0x01: "Unknown command",
+                0x02: "Invalid params",
+                0x03: "Device not ready",
+                0x04: "HW error",
+                0x05: "CRC mismatch",
+                0x06: "Invalid payload size",
+            }
+            err_str = error_names.get(error_code, f"code=0x{error_code:02X}")
+            print(f"[RX] Error seq={seq:02X} {err_str}")
+            self.status_label.setText(f"ОШИБКА MCU: {err_str}")
+            self.status_label.setStyleSheet("color: red;")
+            self._pending_cmd_seq = None
+
+        if matched and self._after_response_callback:
+            cb = self._after_response_callback
+            self._after_response_callback = None
+            cb()
+
+    def _on_channel_toggled(self, idx: int, checked: bool):
+        """Обработка переключения видимости канала."""
+        self.channels[idx].setVisible(checked)
+        # Пересчитываем активные каналы
+        new_active = [i for i, cb in enumerate(self.channel_checkboxes) if cb.isChecked()]
+        if not new_active:
+            # Не даём отключить все каналы — оставляем текущий
+            self.channel_checkboxes[idx].setChecked(True)
+            return
+        if new_active != self.active_channels:
+            self._on_channels_changed(new_active)
+
+    def _on_channels_changed(self, new_active: list[int]):
+        """Смена активных каналов: остановка, ожидание Response, сброс, старт."""
+        print(f"[UI] Channels changed: {self.active_channels} -> {new_active}")
+        self.active_channels = new_active
+        self.data_recorder = DataRecorder(self.SAMPLE_FREQ, self.active_channels)
+
+        if self.sport and self.sport.is_open:
+            def do_start():
+                if self.serial_worker:
+                    self.serial_worker.parser.reset()
+                    self.serial_worker.reset_stats()
+                for ch in self.channels:
+                    ch.clear_data()
+                self._send_start_stream()
+
+            self._send_stop_stream(on_response=do_start)
+
+    def _on_samplerate_changed(self, index: int):
+        """Смена частоты дискретизации: остановка, ожидание Response, сброс, старт."""
+        freq_map = {0: 250, 1: 500, 2: 1000, 3: 4000}
+        new_freq = freq_map.get(index, 1000)
+        if new_freq == self.SAMPLE_FREQ:
+            return
+
+        print(f"[UI] Samplerate changed: {self.SAMPLE_FREQ} -> {new_freq}")
+        self.SAMPLE_FREQ = new_freq
+
+        # Обновить все каналы и Fourier
+        for ch in self.channels:
+            ch.set_sample_freq(new_freq)
+        self.fourier_widget.sample_rate = new_freq
+        self.data_recorder = DataRecorder(self.SAMPLE_FREQ, self.active_channels)
+        self._clear_channel_data()
+
+        if self.sport and self.sport.is_open:
+            def do_start():
+                if self.serial_worker:
+                    self.serial_worker.parser.reset()
+                    self.serial_worker.reset_stats()
+                for ch in self.channels:
+                    ch.clear_data()
+                self._send_start_stream()
+
+            def do_set_samplerate():
+                self._send_set_samplerate(index, on_response=do_start)
+
+            def after_stop():
+                # Даём MCU ~150 мс выдать хвост из TX-буфера
+                QTimer.singleShot(150, do_set_samplerate)
+
+            self._send_stop_stream(on_response=after_stop)
+
+    def _on_vref_changed(self, mv: int):
+        """Смена опорного напряжения — сразу отправляем команду."""
+        self._send_set_vref(mv)
 
     def _refresh_ports(self):
         """Обновление списка доступных портов"""
@@ -707,6 +769,13 @@ class EEGPlotter(QMainWindow):
                 metadata = self.playback_worker.get_metadata()
                 file_freq = metadata.get('sample_freq', self.SAMPLE_FREQ)
 
+                # Установить активные каналы из файла
+                file_active = self.playback_worker.get_active_channels()
+                if file_active:
+                    self.active_channels = file_active
+                    for i, cb in enumerate(self.channel_checkboxes):
+                        cb.setChecked(i in self.active_channels)
+
                 # Установить частоту из файла
                 for ch in self.channels:
                     ch.set_sample_freq(file_freq)
@@ -884,14 +953,49 @@ class EEGPlotter(QMainWindow):
         secs = int(seconds % 60)
         return f"{minutes:02d}:{secs:02d}"
 
+    def _check_latency_timer(self, port: str) -> int:
+        """Проверить FTDI latency timer (критично для 2 Мбод)."""
+        try:
+            import glob
+            for p in glob.glob('/sys/bus/usb-serial/devices/*/latency_timer'):
+                if port in p or port.replace('/dev/', '') in p:
+                    with open(p) as f:
+                        return int(f.read().strip())
+        except Exception:
+            pass
+        return -1
+
     def connect_sport(self):
         """Подключение к serial порту"""
         port_text = self.port_combo.currentText()
         port = port_text.split(" - ")[0]
         try:
-            self.sport = serial.Serial(port, self.BAUD_RATE)
+            self.sport = serial.Serial(
+                port=port,
+                baudrate=self.BAUD_RATE,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=0,
+                rtscts=False,
+                dsrdtr=False,
+                xonxoff=False,
+            )
+            self.sport.rts = False
+            self.sport.dtr = False
+            self.sport.reset_input_buffer()
+            self.sport.reset_output_buffer()
+            print(f"[Serial] Opened {port} at {self.sport.baudrate} baud")
+
+            latency = self._check_latency_timer(port)
+            if latency > 1:
+                print(f"[WARN] FTDI latency_timer = {latency} ms! Рекомендуется 1 мс для 2 Мбод.")
+                print(f"       sudo sh -c 'echo 1 > /sys/bus/usb-serial/devices/{port.replace('/dev/', '')}/latency_timer'")
+            elif latency == 1:
+                print(f"[OK] FTDI latency_timer = 1 ms")
             self.serial_worker = SerialWorker(self.sport)
             self.serial_worker.data_received.connect(self.update_data)
+            self.serial_worker.response_received.connect(self._on_response_received)
             self.serial_worker.start()
             self.connect_btn.setEnabled(False)
             self.disconnect_btn.setEnabled(True)
@@ -899,8 +1003,21 @@ class EEGPlotter(QMainWindow):
             # Включаем запись, отключаем воспроизведение
             self.record_btn.setEnabled(True)
             self._disable_playback_controls()
+
+            # Инициализация MCU (интервал ~2 мс между командами)
+            self._send_set_samplerate(self.samplerate_combo.currentIndex())
+            time.sleep(0.002)
+            self._send_set_vref(self.vref_spin.value())
+            time.sleep(0.002)
+            self._send_start_stream()
+            self._clear_channel_data()
+
+            self.status_label.setText("Подключено")
+            self.status_label.setStyleSheet("color: green;")
             print(f"Подключено к {port}")
         except SerialException as e:
+            self.status_label.setText(f"Ошибка: {e}")
+            self.status_label.setStyleSheet("color: red;")
             print(f"Ошибка подключения: {e}")
 
     def disconnect_sport(self):
@@ -910,11 +1027,18 @@ class EEGPlotter(QMainWindow):
             self._toggle_recording(False)
             self.record_btn.setChecked(False)
 
+        # Остановить стрим на MCU
+        self._send_stop_stream()
+
+        # Сбросить ожидание ответа
+        self._pending_cmd_seq = None
+        self._cmd_timeout_timer.stop()
+
         if self.serial_worker:
             self.serial_worker.stop()
             self.serial_worker = None
 
-        if self.sport.is_open:
+        if self.sport and self.sport.is_open:
             self.sport.close()
 
         self.connect_btn.setEnabled(True)
@@ -924,15 +1048,19 @@ class EEGPlotter(QMainWindow):
         self.record_btn.setEnabled(False)
         self._enable_playback_controls()
 
+        self.status_label.setText("Отключено")
+        self.status_label.setStyleSheet("color: gray;")
         print("Отключено")
 
     def update_data(self, data):
-        """Обновление данных по событию от воркера"""
+        """Обновление данных по событию от воркера или плеера"""
         if data is not None:
             fft_ch = self.fourier_widget.selected_channel_index
-            for i, ch in enumerate(self.channels):
-                if i < len(data) and (self.channel_checkboxes[i].isChecked() or i == fft_ch):
-                    ch.append_data(data[i])
+            for i, ch_idx in enumerate(self.active_channels):
+                if i < len(data):
+                    ch = self.channels[ch_idx]
+                    if self.channel_checkboxes[ch_idx].isChecked() or ch_idx == fft_ch:
+                        ch.append_data(data[i])
             # Записываем если активна запись (и не в режиме воспроизведения)
             if self.is_recording and not self.playback_mode:
                 self.data_recorder.add_sample(data)
@@ -950,7 +1078,7 @@ class EEGPlotter(QMainWindow):
         if self.playback_worker:
             self.playback_worker.stop()
             self.playback_worker.wait()
-        if self.sport.is_open:
+        if self.sport and self.sport.is_open:
             self.sport.close()
         event.accept()
 

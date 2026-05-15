@@ -12,12 +12,13 @@ class DataRecorder:
     Формат файла:
     1. 4 байта — длина JSON заголовка (little-endian uint32)
     2. JSON заголовок (UTF-8) с метаданными
-    3. Binary data — сырые данные uint16, interleaved (ch1, ch2, ch1, ch2, ...)
+    3. Binary data — float32, interleaved (ch1, ch2, ch1, ch2, ...)
     """
 
-    def __init__(self, sample_freq: int = 2000, channels: int = 2):
+    def __init__(self, sample_freq: int = 2000, active_channels: list[int] = None):
         self.sample_freq = sample_freq
-        self.channels = channels
+        self.active_channels = active_channels if active_channels is not None else [0, 1]
+        self.channels = len(self.active_channels)
         self.is_recording = False
         self.data_buffer: list[np.ndarray] = []
         self.start_time: Optional[datetime] = None
@@ -63,10 +64,11 @@ class DataRecorder:
 
         # Создаём метаданные
         metadata = {
-            'version': 3,
+            'version': 4,
             'data_dtype': 'float32',
             'sample_freq': self.sample_freq,
             'channels': self.channels,
+            'active_channels': self.active_channels,
             'created_at': self.start_time.isoformat() if self.start_time else datetime.now().isoformat(),
             'duration_seconds': self.get_duration(),
             'samples_count': len(self.data_buffer),
@@ -117,6 +119,8 @@ class DataRecorder:
             # Конвертируем в numpy (поддержка старых файлов uint16 и новых float32)
             dtype = metadata.get('data_dtype', 'uint16')
             data = np.frombuffer(data_bytes, dtype=np.dtype(dtype))
-            data = data.reshape((samples_count, channels))
+            # Для старых файлов channels мог быть int, для новых — из active_channels
+            actual_channels = len(metadata.get('active_channels', list(range(channels))))
+            data = data.reshape((samples_count, actual_channels))
 
         return data, metadata
