@@ -31,9 +31,10 @@ class SerialWorker(QThread):
     data_received = pyqtSignal(np.ndarray)
     response_received = pyqtSignal(int, int, bytes)  # type, seq, payload
 
-    def __init__(self, sport):
+    def __init__(self, sport, sample_freq: int = 250):
         super().__init__()
         self.sport = sport
+        self.sample_freq = sample_freq
         self.running = False
         self.parser = SerProtParser()
 
@@ -42,12 +43,17 @@ class SerialWorker(QThread):
         self.last_time = time.perf_counter()
         self.last_print_time = self.last_time
 
+        # Drift-анализ (теоретическое vs фактическое)
+        self.total_packets = 0
+        self.start_time = 0.0
+
     def run(self):
         self.running = True
         if not self.sport.is_open:
             return
 
-        print(f"[{time.strftime('%H:%M:%S')}] SerialWorker запущен")
+        self.start_time = time.perf_counter()
+        print(f"[{time.strftime('%H:%M:%S')}] SerialWorker запущен (sample_freq={self.sample_freq})")
 
         while self.running:
             try:
@@ -60,17 +66,26 @@ class SerialWorker(QThread):
                             if frame.type == TYPE_PUSH:
                                 samples = SerProtMaster.decode_adc_samples(frame.payload)
                                 self.packet_count += 1
+                                self.total_packets += 1
                                 self.data_received.emit(np.array(samples, dtype=np.float32))
                             elif frame.type in (SerProtMaster.TYPE_RESPONSE, SerProtMaster.TYPE_ERROR):
                                 self.response_received.emit(frame.type, frame.seq, frame.payload)
 
                     current_time = time.perf_counter()
-                    if current_time - self.last_print_time >= 1.0:
-                        elapsed = current_time - self.last_print_time
-                        rate = self.packet_count / elapsed if elapsed > 0 else 0
-                        print(f"[{time.strftime('%H:%M:%S.%f')[:-3]}] "
-                              f"Пакетов: {self.packet_count} | "
-                              f"Скорость: {rate:.1f} пак/сек")
+                    if current_time - self.last_print_time >= 5.0:
+                        elapsed_total = current_time - self.start_time
+                        expected = int(elapsed_total * self.sample_freq)
+                        actual = self.total_packets
+                        drift = actual - expected
+                        drift_pct = (drift / expected * 100.0) if expected > 0 else 0.0
+
+                        instant_elapsed = current_time - self.last_print_time
+                        instant_rate = self.packet_count / instant_elapsed if instant_elapsed > 0 else 0
+
+                        print(f"[DRIFT] Expected: {expected:>7} pkts | "
+                              f"Actual: {actual:>7} pkts | "
+                              f"Drift: {drift:+7d} ({drift_pct:+6.2f}%) | "
+                              f"Instant: {instant_rate:>6.1f} pps")
                         self.packet_count = 0
                         self.last_print_time = current_time
 
@@ -78,15 +93,21 @@ class SerialWorker(QThread):
                 print(f"[{time.strftime('%H:%M:%S')}] Ошибка: {e}")
                 self.running = False
 
+    def set_sample_freq(self, sample_freq: int):
+        """Обновить эталонную частоту для drift-анализа (при смене samplerate)."""
+        self.sample_freq = sample_freq
+
     def reset_stats(self):
         """Сбросить счётчики пакетов (при смене конфигурации)."""
         self.packet_count = 0
+        self.total_packets = 0
+        self.start_time = time.perf_counter()
         self.last_time = time.perf_counter()
         self.last_print_time = self.last_time
 
     def stop(self):
         print(f"[{time.strftime('%H:%M:%S')}] SerialWorker останавливается. "
-              f"Всего пакетов получено: {self.packet_count}")
+              f"Всего пакетов получено: {self.total_packets}")
         self.running = False
         self.wait()
 
@@ -237,6 +258,18 @@ class EEGPlotter(QMainWindow):
         self.vref_spin.setSingleStep(100)
         self.vref_spin.valueChanged.connect(self._on_vref_changed)
         toolbar.addWidget(self.vref_spin)
+
+        toolbar.addSeparator()
+
+        # Усиление (Gain) для RTI
+        toolbar.addWidget(QLabel("Gain:"))
+        self.gain_spin = QDoubleSpinBox()
+        self.gain_spin.setRange(0.01, 10000.0)
+        self.gain_spin.setValue(1.0)
+        self.gain_spin.setDecimals(2)
+        self.gain_spin.setSingleStep(0.1)
+        self.gain_spin.valueChanged.connect(self._on_gain_changed)
+        toolbar.addWidget(self.gain_spin)
 
         toolbar.addSeparator()
 
@@ -561,6 +594,7 @@ class EEGPlotter(QMainWindow):
             def do_start():
                 if self.serial_worker:
                     self.serial_worker.parser.reset()
+                    self.serial_worker.set_sample_freq(self.SAMPLE_FREQ)
                     self.serial_worker.reset_stats()
                 for ch in self.channels:
                     ch.clear_data()
@@ -578,6 +612,11 @@ class EEGPlotter(QMainWindow):
     def _on_vref_changed(self, mv: int):
         """Смена опорного напряжения — сразу отправляем команду."""
         self._send_set_vref(mv)
+
+    def _on_gain_changed(self, value: float):
+        """Смена усиления — обновляем RTI на всех каналах."""
+        for ch in self.channels:
+            ch.update_noise_display(value)
 
     def _refresh_ports(self):
         """Обновление списка доступных портов"""
@@ -769,13 +808,6 @@ class EEGPlotter(QMainWindow):
                 metadata = self.playback_worker.get_metadata()
                 file_freq = metadata.get('sample_freq', self.SAMPLE_FREQ)
 
-                # Установить активные каналы из файла
-                file_active = self.playback_worker.get_active_channels()
-                if file_active:
-                    self.active_channels = file_active
-                    for i, cb in enumerate(self.channel_checkboxes):
-                        cb.setChecked(i in self.active_channels)
-
                 # Установить частоту из файла
                 for ch in self.channels:
                     ch.set_sample_freq(file_freq)
@@ -804,7 +836,6 @@ class EEGPlotter(QMainWindow):
             # Запускаем воспроизведение
             self.playback_mode = True
             self._clear_channel_data()
-            self.playback_worker.reset()
             self.playback_worker.start()
             self.play_btn.setText("Пауза")
             # Отключаем serial controls
@@ -828,6 +859,7 @@ class EEGPlotter(QMainWindow):
         if self.playback_worker:
             self.playback_worker.stop()
             self.playback_worker.wait()
+            self.playback_worker.reset()
 
         self.playback_mode = False
         self.play_btn.setText("Воспр.")
@@ -850,6 +882,8 @@ class EEGPlotter(QMainWindow):
         """Обработка окончания воспроизведения"""
         self.playback_mode = False
         self.play_btn.setText("Воспр.")
+        if self.playback_worker:
+            self.playback_worker.reset()
 
         # Восстанавливаем исходную частоту
         for ch in self.channels:
@@ -993,7 +1027,7 @@ class EEGPlotter(QMainWindow):
                 print(f"       sudo sh -c 'echo 1 > /sys/bus/usb-serial/devices/{port.replace('/dev/', '')}/latency_timer'")
             elif latency == 1:
                 print(f"[OK] FTDI latency_timer = 1 ms")
-            self.serial_worker = SerialWorker(self.sport)
+            self.serial_worker = SerialWorker(self.sport, sample_freq=self.SAMPLE_FREQ)
             self.serial_worker.data_received.connect(self.update_data)
             self.serial_worker.response_received.connect(self._on_response_received)
             self.serial_worker.start()
@@ -1056,20 +1090,31 @@ class EEGPlotter(QMainWindow):
         """Обновление данных по событию от воркера или плеера"""
         if data is not None:
             fft_ch = self.fourier_widget.selected_channel_index
-            for i, ch_idx in enumerate(self.active_channels):
-                if i < len(data):
-                    ch = self.channels[ch_idx]
-                    if self.channel_checkboxes[ch_idx].isChecked() or ch_idx == fft_ch:
-                        ch.append_data(data[i])
+            if self.playback_mode:
+                # Playback: data — полный массив для всех NUM_CHANNELS каналов
+                for ch_idx in self.active_channels:
+                    if ch_idx < len(data):
+                        ch = self.channels[ch_idx]
+                        if self.channel_checkboxes[ch_idx].isChecked() or ch_idx == fft_ch:
+                            ch.append_data(data[ch_idx])
+            else:
+                # Real-time: data — массив только для активных каналов
+                for i, ch_idx in enumerate(self.active_channels):
+                    if i < len(data):
+                        ch = self.channels[ch_idx]
+                        if self.channel_checkboxes[ch_idx].isChecked() or ch_idx == fft_ch:
+                            ch.append_data(data[i])
             # Записываем если активна запись (и не в режиме воспроизведения)
             if self.is_recording and not self.playback_mode:
                 self.data_recorder.add_sample(data)
 
     def _update_all_channels(self):
         """Обновление всех графиков по таймеру"""
+        gain = self.gain_spin.value()
         for ch in self.channels:
             if ch.isVisible():
                 ch.update_display()
+                ch.update_noise_display(gain)
 
     def closeEvent(self, event):
         """Обработка закрытия окна"""

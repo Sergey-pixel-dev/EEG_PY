@@ -1,6 +1,6 @@
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtWidgets import QWidget, QVBoxLayout
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel
 from scipy import signal
 from circularbuffer import CircularBuffer
 from fourier_analysis_widget import ZoomableViewBox
@@ -106,6 +106,7 @@ class EEGChannelWidget(QWidget):
 
         self.curve = None
         self.cursor_line = None
+        self.noise_label = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -128,6 +129,9 @@ class EEGChannelWidget(QWidget):
         self.plot_widget.setClipToView(True)
 
         layout.addWidget(self.plot_widget)
+        self.noise_label = QLabel("Noise: -- mV (-- µV)<br>RMS: -- mV (-- µV)<br>RTI: -- mV (-- µV)")
+        self.noise_label.setStyleSheet("color: #0066cc; font-size: 12px; font-weight: bold;")
+        layout.addWidget(self.noise_label)
         self.setLayout(layout)
 
     def update_display(self):
@@ -155,6 +159,8 @@ class EEGChannelWidget(QWidget):
         else:
             self.curve.setData(self.x_axis, y, skipFiniteCheck=True)
             self.cursor_line.setPos(cursor_position_with_gap)
+
+
 
     def append_data(self, value):
         """Добавление данных в буфер с батч-фильтрацией для производительности."""
@@ -218,6 +224,62 @@ class EEGChannelWidget(QWidget):
             new_range = self.y_range
         self.plot_widget.setLabel('left', self.channel_name, units=unit)
         self.plot_widget.setYRange(new_range[0], new_range[1], padding=0)
+
+    def get_noise_floor(self) -> float:
+        """Рассчитать noise floor по тихим участкам (sliding window + P25)."""
+        buf = self.raw_data.get_straight_buffer()
+        min_samples = int(self.sample_freq * 2)
+        if len(buf) < min_samples:
+            return 0.0
+
+        # Последние 5 секунд
+        n_samples = int(self.sample_freq * 5)
+        buf = buf[-n_samples:]
+
+        window_size = int(self.sample_freq * 1.0)  # 1.0 сек
+        step = max(1, int(self.sample_freq * 0.5))  # 0.5 сек overlap
+
+        windows = []
+        for i in range(0, len(buf) - window_size + 1, step):
+            window = buf[i:i + window_size]
+            p2p = float(np.max(window) - np.min(window))
+            windows.append((p2p, window))
+
+        if not windows:
+            return 0.0
+
+        # Сортируем по peak-to-peak, берём нижние 25%
+        windows.sort(key=lambda x: x[0])
+        n_quiet = max(1, len(windows) // 4)
+        quiet_data = np.concatenate([w[1] for w in windows[:n_quiet]])
+        rms = np.sqrt(np.mean(quiet_data ** 2))
+        return float(rms)
+
+    def get_simple_rms(self) -> float:
+        """Простой RMS за последние 5 секунд."""
+        buf = self.raw_data.get_straight_buffer()
+        n_samples = int(self.sample_freq * 5)
+        if len(buf) < n_samples // 2:
+            return 0.0
+        buf = buf[-n_samples:]
+        return float(np.sqrt(np.mean(buf ** 2)))
+
+    def update_noise_display(self, gain: float = 1.0):
+        """Обновить текстовую панель с тремя метриками (mV первично)."""
+        noise_uv = self.get_noise_floor()
+        rms_uv = self.get_simple_rms()
+        rti_uv = rms_uv / gain if gain > 0 else 0.0
+
+        def fmt(uv: float) -> str:
+            if uv <= 0:
+                return "-- mV (-- µV)"
+            mv = uv * 0.001
+            return f"{mv:.2f} mV ({uv:.1f} µV)"
+
+        text = (f"<span style='color:#0066cc;'>Noise:</span> {fmt(noise_uv)}<br>"
+                f"<span style='color:#0066cc;'>RMS:</span>  {fmt(rms_uv)}<br>"
+                f"<span style='color:#0066cc;'>RTI:</span>  {fmt(rti_uv)}")
+        self.noise_label.setText(text)
 
     def clear_data(self):
         """Очистка буферов данных"""

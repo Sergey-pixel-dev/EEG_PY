@@ -20,8 +20,9 @@ class PlaybackWorker(QThread):
 
     BATCH_INTERVAL_MS = 10  # 10мс между батчами
 
-    def __init__(self):
+    def __init__(self, num_channels: int = 8):
         super().__init__()
+        self.num_channels = num_channels
         self.data: Optional[np.ndarray] = None
         self.metadata: Optional[dict] = None
         self.sample_freq = 2000
@@ -67,6 +68,8 @@ class PlaybackWorker(QThread):
         batch_interval = self.BATCH_INTERVAL_MS / 1000.0  # 0.01 сек
 
         last_batch_time = time.perf_counter()
+        start_time = time.perf_counter()
+        last_print_time = start_time
 
         while self.running and self.current_index < total_samples:
             # Обработка запроса на перемотку
@@ -85,11 +88,24 @@ class PlaybackWorker(QThread):
             elapsed = current_time - last_batch_time
 
             if elapsed >= batch_interval:
-                # Эмитим батч сэмплов
+                # Эмитим батч сэмплов (полный массив для всех каналов)
                 end_index = min(self.current_index + batch_size, total_samples)
 
                 for i in range(self.current_index, end_index):
-                    self.data_received.emit(self.data[i])
+                    # Синус для всех каналов как placeholder
+                    t = i / self.sample_freq
+                    full_sample = np.zeros(self.num_channels, dtype=np.float32)
+                    for ch_idx in range(self.num_channels):
+                        freq = ch_idx + 1
+                        amplitude = 200 - ch_idx * 20
+                        full_sample[ch_idx] = np.sin(2 * np.pi * t * freq) * amplitude
+
+                    # Заменяем записанные каналы реальными данными
+                    for j, ch_idx in enumerate(self.active_channels):
+                        if j < len(self.data[i]):
+                            full_sample[ch_idx] = self.data[i][j]
+
+                    self.data_received.emit(full_sample)
 
                 self.current_index = end_index
                 last_batch_time = current_time
@@ -97,6 +113,18 @@ class PlaybackWorker(QThread):
                 # Эмитим прогресс
                 current_sec = self.current_index / self.sample_freq
                 self.playback_progress.emit(current_sec, total_duration)
+
+                # Drift-анализ каждые 5 сек
+                if current_time - last_print_time >= 5.0:
+                    elapsed_total = current_time - start_time
+                    expected = int(elapsed_total * self.sample_freq)
+                    actual = self.current_index
+                    drift = actual - expected
+                    drift_pct = (drift / expected * 100.0) if expected > 0 else 0.0
+                    print(f"[PLAYBACK DRIFT] Expected: {expected:>7} smpl | "
+                          f"Actual: {actual:>7} smpl | "
+                          f"Drift: {drift:+7d} ({drift_pct:+6.2f}%)")
+                    last_print_time = current_time
             else:
                 # Спим оставшееся время (с запасом)
                 sleep_time = batch_interval - elapsed - 0.001
